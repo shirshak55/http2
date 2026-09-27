@@ -156,7 +156,7 @@ impl Recv {
     /// The caller ensures that the frame represents headers and not trailers.
     pub fn recv_headers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
@@ -233,6 +233,7 @@ impl Recv {
         }
 
         let stream_id = frame.stream_id();
+        let order = frame.take_header_order();
         let (pseudo, fields) = frame.into_parts();
 
         if pseudo.protocol.is_some()
@@ -251,7 +252,7 @@ impl Recv {
         if !pseudo.is_informational() {
             let message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, order, stream_id)?;
 
             // Push the frame onto the stream's recv buffer
             stream
@@ -271,7 +272,7 @@ impl Recv {
             // Convert to response and store it for polling
             let message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, order, stream_id)?;
 
             tracing::trace!("Received informational response: stream_id={:?}", stream_id);
 

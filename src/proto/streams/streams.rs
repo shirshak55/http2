@@ -18,7 +18,7 @@ use super::{
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
-    ext::Protocol,
+    ext::{HeaderOrder, Protocol},
     frame::{self, Frame, Reason},
     proto,
     proto::{peer, Error, Initiator, Open, Peer, WindowSize},
@@ -246,6 +246,7 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let order = request.extensions_mut().remove::<HeaderOrder>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -310,6 +311,7 @@ where
             stream_id,
             request,
             protocol,
+            order,
             end_of_stream,
             me.headers_pseudo_order.clone(),
             me.headers_stream_dependency,
@@ -1255,6 +1257,7 @@ impl<B> StreamRef<B> {
         mut response: Response<()>,
         end_of_stream: bool,
     ) -> Result<(), UserError> {
+        let order = response.extensions_mut().remove::<HeaderOrder>();
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
         let mut me = self.opaque.inner.lock();
@@ -1266,7 +1269,8 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let frame =
+                server::Peer::convert_send_message(stream.id, response, order, end_of_stream);
 
             actions
                 .send

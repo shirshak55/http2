@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{HeaderOrder, Protocol};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
@@ -1705,6 +1705,7 @@ impl Peer {
         id: StreamId,
         request: Request<()>,
         protocol: Option<Protocol>,
+        order: Option<HeaderOrder>,
         end_of_stream: bool,
         pseudo_order: Option<PseudoOrder>,
         headers_stream_dependency: Option<StreamDependency>,
@@ -1763,6 +1764,9 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
+        if let Some(order) = order {
+            headers_frame.set_header_order(order);
+        }
         if let Some(stream_dep) = headers_stream_dependency {
             headers_frame.set_stream_dependency(stream_dep);
         }
