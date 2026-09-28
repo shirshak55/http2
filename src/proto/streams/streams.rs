@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt, io,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -109,7 +110,15 @@ struct Inner {
 
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
+
+    /// The streams opened for requests carrying their recorded stream id (see
+    /// [`HeadersFrameOptions::recorded_stream_id`]), by that id, newest last
+    recorded_streams: VecDeque<(u32, StreamId)>,
 }
+
+/// How many of the streams opened for requests carrying their recorded stream id are
+/// kept, to renumber the dependencies of the requests after them.
+const RECORDED_STREAMS: usize = 256;
 
 #[derive(Debug)]
 struct Actions {
@@ -325,7 +334,26 @@ where
                 frame
                     .pseudo_order
                     .or_else(|| me.headers_pseudo_order.clone()),
-                frame.priority,
+                match frame.recorded_stream_id {
+                    Some(recorded) => {
+                        let priority = frame.priority.map(|priority| {
+                            let dependency = u32::from(priority.dependency_id());
+                            let renumbered = me
+                                .recorded_streams
+                                .iter()
+                                .rev()
+                                .find(|(id, _)| *id == dependency)
+                                .map_or(StreamId::ZERO, |(_, opened)| *opened);
+                            priority.depending_on(renumbered)
+                        });
+                        if me.recorded_streams.len() == RECORDED_STREAMS {
+                            me.recorded_streams.pop_front();
+                        }
+                        me.recorded_streams.push_back((recorded, stream_id));
+                        priority
+                    }
+                    None => frame.priority,
+                },
                 frame.following,
             ),
             None => (
@@ -548,6 +576,7 @@ impl Inner {
             priorities_once: config.priorities_once,
             unknown_frames: config.unknown_frames,
             frame_log: config.frame_log,
+            recorded_streams: VecDeque::new(),
         }))
     }
 

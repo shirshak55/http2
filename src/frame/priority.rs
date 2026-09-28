@@ -134,6 +134,14 @@ impl StreamDependency {
         self.dependency_id
     }
 
+    /// The same fields depending on `dependency_id` instead.
+    pub(crate) fn depending_on(self, dependency_id: StreamId) -> Self {
+        StreamDependency {
+            dependency_id,
+            ..self
+        }
+    }
+
     pub fn encode<T: BufMut>(&self, dst: &mut T) {
         const STREAM_ID_MASK: u32 = 1 << 31;
         let mut dependency_id = self.dependency_id.into();

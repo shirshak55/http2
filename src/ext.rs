@@ -83,6 +83,11 @@ pub struct HeadersFrameOptions {
     /// The priority fields (dependency, weight, exclusive flag); `None` sends the frame
     /// without the PRIORITY flag.
     pub priority: Option<StreamDependency>,
+    /// The id the request's stream had on the connection `priority` was recorded on, whose
+    /// stream ids its dependency names: it then depends on the stream this connection
+    /// opened for the request recorded with that id, or on none (the root) when no such
+    /// request was sent here yet.
+    pub recorded_stream_id: Option<u32>,
     /// Frames to send right after the HEADERS frame, in order, before any DATA.
     pub following: Vec<FollowingFrame>,
 }
