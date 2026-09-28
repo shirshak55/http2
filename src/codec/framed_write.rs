@@ -1,6 +1,7 @@
 use crate::codec::UserError;
 use crate::codec::UserError::*;
-use crate::frame::{self, Frame, FrameSize};
+use crate::ext::{FrameLog, LoggedFrame};
+use crate::frame::{self, Frame, FrameSize, StreamDependency};
 use crate::{hpack, tracing};
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -52,6 +53,9 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// Logs the frames sent, when recording them.
+    frame_log: Option<FrameLog>,
 }
 
 #[derive(Debug)]
@@ -99,6 +103,7 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                frame_log: None,
             },
         }
     }
@@ -220,6 +225,10 @@ where
 
         tracing::debug!(frame = ?item, "send");
 
+        if let Some(log) = &self.frame_log {
+            log_frame(log, &item);
+        }
+
         match item {
             Frame::Data(mut v) => {
                 // Ensure that the payload is not greater than the max frame.
@@ -253,7 +262,10 @@ where
                     self.last_data_frame = Some(v);
                 }
             }
-            Frame::Headers(v) => {
+            Frame::Headers(mut v) => {
+                for frame in v.take_leading() {
+                    frame.encode(self.buf.get_mut());
+                }
                 let mut buf = limited_write_buf!(self);
                 if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
                     self.next = Some(Next::Continuation(continuation));
@@ -290,6 +302,10 @@ where
                 v.encode(self.buf.get_mut());
                 tracing::trace!(rem = self.buf.remaining(), "encoded reset");
             }
+            Frame::Unknown(v) => {
+                v.encode(self.buf.get_mut());
+                tracing::trace!(rem = self.buf.remaining(), "encoded unknown frame");
+            }
         }
 
         Ok(())
@@ -315,6 +331,60 @@ impl<B> Encoder<B> {
     }
 }
 
+/// Logs a frame about to be encoded, but DATA, as it goes on the wire.
+fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
+    let logged = match frame {
+        Frame::Settings(f) => LoggedFrame::Settings {
+            ack: f.is_ack(),
+            params: f.params(),
+        },
+        Frame::WindowUpdate(f) => LoggedFrame::WindowUpdate {
+            stream_id: f.stream_id().into(),
+            increment: f.size_increment(),
+        },
+        Frame::Priority(f) => LoggedFrame::Priority {
+            stream_id: f.stream_id().into(),
+            priority: f.dependency().to_ext(),
+        },
+        Frame::Headers(f) => {
+            for frame in f.leading() {
+                log.push(unknown_frame(frame));
+            }
+            LoggedFrame::Headers {
+                stream_id: f.stream_id().into(),
+                end_stream: f.is_end_stream(),
+                priority: f.stream_dep().map(StreamDependency::to_ext),
+                pseudo_order: f.encoded_pseudo_order(),
+            }
+        }
+        Frame::Ping(f) => LoggedFrame::Ping {
+            ack: f.is_ack(),
+            payload: *f.payload(),
+        },
+        Frame::Reset(f) => LoggedFrame::Reset {
+            stream_id: f.stream_id().into(),
+            error_code: f.reason().into(),
+        },
+        Frame::GoAway(f) => LoggedFrame::GoAway {
+            last_stream_id: f.last_stream_id().into(),
+            error_code: f.reason().into(),
+        },
+        Frame::Unknown(f) => unknown_frame(f),
+        Frame::Data(_) | Frame::PushPromise(_) => return,
+    };
+    log.push(logged);
+}
+
+fn unknown_frame(frame: &frame::Unknown) -> LoggedFrame {
+    LoggedFrame::Unknown {
+        kind: frame.kind(),
+        flags: frame.flags(),
+        stream_id: frame.stream_id(),
+        length: frame.payload().len() as u32,
+        payload: frame.payload().clone(),
+    }
+}
+
 impl<T, B> FramedWrite<T, B> {
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
@@ -330,6 +400,11 @@ impl<T, B> FramedWrite<T, B> {
     /// Set the peer's header table size.
     pub fn set_header_table_size(&mut self, val: usize) {
         self.encoder.hpack.update_max_size(val);
+    }
+
+    /// Logs every frame sent but DATA to `log`.
+    pub fn set_frame_log(&mut self, log: FrameLog) {
+        self.encoder.frame_log = Some(log);
     }
 
     /// Retrieve the last data frame that has been sent

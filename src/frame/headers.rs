@@ -1,5 +1,5 @@
-use super::{util, StreamDependency, StreamId};
-use crate::ext::{HeaderOrder, Protocol};
+use super::{util, StreamDependency, StreamId, Unknown};
+use crate::ext::{HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 use crate::tracing;
@@ -35,6 +35,9 @@ pub struct Headers {
 
     /// The associated flags
     flags: HeadersFlag,
+
+    /// Frames of undefined types to send right ahead of this one
+    leading: Vec<Unknown>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -250,6 +253,7 @@ impl Headers {
                 pseudo,
             },
             flags: HeadersFlag::default(),
+            leading: Vec::new(),
         }
     }
 
@@ -268,6 +272,7 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            leading: Vec::new(),
         }
     }
 
@@ -334,6 +339,7 @@ impl Headers {
                 pseudo: Pseudo::default(),
             },
             flags,
+            leading: Vec::new(),
         };
 
         Ok((headers, src))
@@ -401,6 +407,40 @@ impl Headers {
         self.stream_dep = Some(stream_dep);
     }
 
+    pub(crate) fn stream_dep(&self) -> Option<StreamDependency> {
+        self.stream_dep
+    }
+
+    /// Sends `frames` right ahead of this frame.
+    pub(crate) fn set_leading(&mut self, frames: Vec<Unknown>) {
+        self.leading = frames;
+    }
+
+    pub(crate) fn leading(&self) -> &[Unknown] {
+        &self.leading
+    }
+
+    pub(crate) fn take_leading(&mut self) -> Vec<Unknown> {
+        std::mem::take(&mut self.leading)
+    }
+
+    /// The pseudo-header fields `encode` writes, in order.
+    pub(crate) fn encoded_pseudo_order(&self) -> Vec<PseudoHeader> {
+        let pseudo = &self.header_block.pseudo;
+        pseudo
+            .order
+            .into_iter()
+            .filter_map(|id| match id {
+                PseudoId::Method => pseudo.method.as_ref().map(|_| PseudoHeader::Method),
+                PseudoId::Scheme => pseudo.scheme.as_ref().map(|_| PseudoHeader::Scheme),
+                PseudoId::Authority => pseudo.authority.as_ref().map(|_| PseudoHeader::Authority),
+                PseudoId::Path => pseudo.path.as_ref().map(|_| PseudoHeader::Path),
+                PseudoId::Protocol => pseudo.protocol.as_ref().map(|_| PseudoHeader::Protocol),
+                PseudoId::Status => pseudo.status.as_ref().map(|_| PseudoHeader::Status),
+            })
+            .collect()
+    }
+
     /// Whether it has status 1xx
     pub(crate) fn is_informational(&self) -> bool {
         self.header_block.pseudo.is_informational()
@@ -459,6 +499,10 @@ impl fmt::Debug for Headers {
 
         if let Some(ref dep) = self.stream_dep {
             builder.field("stream_dep", dep);
+        }
+
+        if !self.leading.is_empty() {
+            builder.field("leading", &self.leading);
         }
 
         // `fields` and `pseudo` purposefully not included

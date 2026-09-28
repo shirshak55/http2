@@ -472,6 +472,16 @@ impl Settings {
         Ok(settings)
     }
 
+    /// The `(identifier, value)` pairs `encode` writes, in order.
+    pub(crate) fn params(&self) -> Vec<(u16, u32)> {
+        if let Some(wire) = &self.wire {
+            return wire.clone();
+        }
+        let mut params = Vec::new();
+        self.for_each(|setting| params.push((setting.id.into(), setting.value)));
+        params
+    }
+
     fn payload_len(&self) -> usize {
         if let Some(wire) = &self.wire {
             return wire.len() * 6;

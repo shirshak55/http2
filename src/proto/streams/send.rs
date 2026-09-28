@@ -194,6 +194,20 @@ impl Send {
         Ok(())
     }
 
+    /// Queues frames on the stream after those already queued.
+    pub fn queue_frames<B>(
+        &mut self,
+        frames: Vec<Frame<B>>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        for frame in frames {
+            tracing::trace!("queue_frame; frame={:?}", frame);
+            self.prioritize.queue_frame(frame, buffer, stream, task);
+        }
+    }
+
     /// Send interim informational headers (1xx responses) without changing stream state.
     /// This allows multiple interim informational responses to be sent before the final response.
     pub fn send_interim_informational_headers<B>(

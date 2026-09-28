@@ -26,6 +26,7 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
+use crate::ext::{FrameLog, UnknownFrame};
 use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
@@ -85,6 +86,12 @@ pub struct Config {
 
     /// Send the priorities ahead of the first request only
     pub priorities_once: bool,
+
+    /// Frames of undefined types to send ahead of the first request's HEADERS
+    pub unknown_frames: Vec<UnknownFrame>,
+
+    /// Logs the frames sent, when recording them
+    pub frame_log: Option<FrameLog>,
 }
 
 trait DebugStructExt<'a, 'b> {

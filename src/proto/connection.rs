@@ -1,4 +1,5 @@
 use crate::codec::UserError;
+use crate::ext::{FrameLog, UnknownFrame};
 use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
@@ -88,6 +89,8 @@ pub(crate) struct Config {
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
     pub priorities_once: bool,
+    pub unknown_frames: Vec<UnknownFrame>,
+    pub frame_log: Option<FrameLog>,
 }
 
 #[derive(Debug)]
@@ -132,6 +135,8 @@ where
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
                 priorities_once: config.priorities_once,
+                unknown_frames: config.unknown_frames.clone(),
+                frame_log: config.frame_log.clone(),
             }
         }
         let streams = Streams::new(streams_config(&config));
@@ -578,6 +583,10 @@ where
             Some(Priority(_frame)) => {
                 tracing::trace!(?_frame, "recv PRIORITY");
                 // TODO: handle
+            }
+            // The codec skips frames of unknown types.
+            Some(Unknown(_frame)) => {
+                tracing::trace!(?_frame, "recv unknown frame");
             }
             None => {
                 tracing::trace!("codec closed");

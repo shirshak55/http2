@@ -133,6 +133,19 @@ impl FlowControl {
         Ok(())
     }
 
+    /// Increase the recv-side window size, leaving the unclaimed capacity as is.
+    ///
+    /// This is called when sending a WINDOW_UPDATE frame of our own.
+    pub fn inc_recv_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        if sz == 0 || sz > MAX_WINDOW_SIZE {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+        let available = self.available.add(sz)?;
+        self.inc_window(sz)?;
+        self.available = available;
+        Ok(())
+    }
+
     /// Decrement the send-side window size.
     ///
     /// This is called after receiving a SETTINGS frame with a lower

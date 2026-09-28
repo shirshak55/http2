@@ -136,12 +136,12 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{HeaderOrder, Protocol};
+use crate::ext::{FrameLog, HeaderOrder, Protocol, UnknownFrame};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
     Headers, Priorities, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder, StreamDependency,
-    StreamId,
+    StreamId, MAX_MAX_FRAME_SIZE,
 };
 use crate::proto::{self, Error};
 use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
@@ -364,6 +364,12 @@ pub struct Builder {
 
     /// The exact SETTINGS parameters to send, in place of `settings`' own
     settings_frame: Option<Vec<(u16, u32)>>,
+
+    /// Frames of undefined types to send ahead of the first request's HEADERS
+    unknown_frames: Vec<UnknownFrame>,
+
+    /// How many of its frames each connection logs, when recording them
+    frame_log_limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -689,6 +695,8 @@ impl Builder {
             priorities: None,
             priorities_once: false,
             settings_frame: None,
+            unknown_frames: Vec::new(),
+            frame_log_limit: None,
         }
     }
 
@@ -1289,6 +1297,37 @@ impl Builder {
         self
     }
 
+    /// Sends `frames`, of types HTTP/2 doesn't define (such as GREASE types), once: ahead
+    /// of the connection's first request's HEADERS frame, right after its
+    /// [`priorities`](Self::priorities) PRIORITY frames. Each is sent as given, stream
+    /// identifier included.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if a payload is longer than a frame can carry (2^24 - 1
+    /// octets).
+    pub fn unknown_frames(&mut self, frames: impl IntoIterator<Item = UnknownFrame>) -> &mut Self {
+        self.unknown_frames = frames.into_iter().collect();
+        assert!(self
+            .unknown_frames
+            .iter()
+            .all(|frame| frame.payload.len() <= MAX_MAX_FRAME_SIZE as usize));
+        self
+    }
+
+    /// Records the frames each connection sends that shape its HTTP/2 fingerprint.
+    ///
+    /// Each connection logs the frames it sends but DATA, in wire order, up to `limit` of
+    /// them, in a [`FrameLog`], and each response carries a
+    /// [`HeadersFrame`](crate::ext::HeadersFrame) extension with its request's HEADERS
+    /// frame's stream, priority fields and pseudo-header order, and that log.
+    ///
+    /// Not recorded by default.
+    pub fn record_frames(&mut self, limit: usize) -> &mut Self {
+        self.frame_log_limit = Some(limit);
+        self
+    }
+
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
@@ -1461,6 +1500,11 @@ where
             codec.set_max_recv_header_list_size(max as usize);
         }
 
+        let frame_log = builder.frame_log_limit.map(FrameLog::new);
+        if let Some(log) = &frame_log {
+            codec.set_frame_log(log.clone());
+        }
+
         // Send initial settings frame
         codec
             .buffer((builder.settings.clone()).into())
@@ -1480,6 +1524,8 @@ where
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
                 priorities_once: builder.priorities_once,
+                unknown_frames: builder.unknown_frames,
+                frame_log,
                 settings: builder.settings,
             },
         );

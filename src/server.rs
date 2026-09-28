@@ -1532,6 +1532,8 @@ where
                             headers_pseudo_order: None,
                             priorities: None,
                             priorities_once: false,
+                            unknown_frames: Vec::new(),
+                            frame_log: None,
                         },
                     );
 

@@ -47,6 +47,7 @@ mod reason;
 mod reset;
 mod settings;
 mod stream_id;
+mod unknown;
 mod util;
 mod window_update;
 
@@ -68,6 +69,7 @@ pub use self::settings::{ExperimentalSettings, ExperimentalSettingsBuilder};
 #[allow(unused_imports)]
 pub use self::settings::{Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder};
 pub use self::stream_id::{StreamId, StreamIdOverflow};
+pub use self::unknown::Unknown;
 pub use self::window_update::WindowUpdate;
 
 #[cfg(feature = "unstable")]
@@ -95,6 +97,7 @@ pub enum Frame<T = Bytes> {
     GoAway(GoAway),
     WindowUpdate(WindowUpdate),
     Reset(Reset),
+    Unknown(Unknown),
 }
 
 impl<T> Frame<T> {
@@ -114,6 +117,7 @@ impl<T> Frame<T> {
             GoAway(frame) => frame.into(),
             WindowUpdate(frame) => frame.into(),
             Reset(frame) => frame.into(),
+            Unknown(frame) => frame.into(),
         }
     }
 }
@@ -132,6 +136,7 @@ impl<T> fmt::Debug for Frame<T> {
             GoAway(ref frame) => fmt::Debug::fmt(frame, fmt),
             WindowUpdate(ref frame) => fmt::Debug::fmt(frame, fmt),
             Reset(ref frame) => fmt::Debug::fmt(frame, fmt),
+            Unknown(ref frame) => fmt::Debug::fmt(frame, fmt),
         }
     }
 }

@@ -18,7 +18,10 @@ use super::{
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
-    ext::{HeaderOrder, HeadersFrameOptions, Protocol},
+    ext::{
+        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, Protocol,
+        UnknownFrame,
+    },
     frame::{self, Frame, Reason},
     proto,
     proto::{peer, Error, Initiator, Open, Peer, WindowSize},
@@ -100,6 +103,12 @@ struct Inner {
 
     /// Send `priorities` ahead of the first request only
     priorities_once: bool,
+
+    /// Frames of undefined types to send ahead of the first request's HEADERS
+    unknown_frames: Vec<UnknownFrame>,
+
+    /// Logs the frames sent, when recording them
+    frame_log: Option<FrameLog>,
 }
 
 #[derive(Debug)]
@@ -311,19 +320,21 @@ where
         }
 
         // Convert the message
-        let (pseudo_order, stream_dependency) = match headers_frame {
+        let (pseudo_order, stream_dependency, following) = match headers_frame {
             Some(frame) => (
                 frame
                     .pseudo_order
                     .or_else(|| me.headers_pseudo_order.clone()),
                 frame.priority,
+                frame.following,
             ),
             None => (
                 me.headers_pseudo_order.clone(),
                 me.headers_stream_dependency,
+                Vec::new(),
             ),
         };
-        let headers = client::Peer::convert_send_message(
+        let mut headers = client::Peer::convert_send_message(
             stream_id,
             request,
             protocol,
@@ -333,6 +344,40 @@ where
             stream_dependency,
         )?;
 
+        let following = following
+            .into_iter()
+            .map(|frame| match frame {
+                FollowingFrame::WindowUpdate(increment) => {
+                    stream
+                        .recv_flow
+                        .inc_recv_window(increment)
+                        .map_err(|_| UserError::InvalidWindowUpdate)?;
+                    Ok(frame::WindowUpdate::new(stream_id, increment).into())
+                }
+                FollowingFrame::Unknown {
+                    kind,
+                    flags,
+                    on_stream,
+                    payload,
+                } => {
+                    if payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
+                        return Err(UserError::PayloadTooBig);
+                    }
+                    let stream_id = if on_stream { stream_id.into() } else { 0 };
+                    Ok(frame::Unknown::new(kind, flags, stream_id, payload).into())
+                }
+            })
+            .collect::<Result<Vec<Frame<B>>, UserError>>()?;
+
+        if let Some(log) = &me.frame_log {
+            stream.sent_headers = Some(HeadersFrame {
+                stream_id: stream_id.into(),
+                priority: headers.stream_dep().map(StreamDependency::to_ext),
+                pseudo_order: headers.encoded_pseudo_order(),
+                connection: log.clone(),
+            });
+        }
+
         let mut stream = me.store.insert(stream.id, stream);
 
         let priorities = if me.priorities_once {
@@ -340,6 +385,12 @@ where
         } else {
             me.priorities.clone()
         };
+        headers.set_leading(
+            std::mem::take(&mut me.unknown_frames)
+                .into_iter()
+                .map(|f| frame::Unknown::new(f.kind, f.flags, f.stream_id, f.payload))
+                .collect(),
+        );
         let sent = me.actions.send.send_priority_and_headers(
             priorities,
             headers,
@@ -356,6 +407,10 @@ where
             stream.remove();
             return Err(err.into());
         }
+
+        me.actions
+            .send
+            .queue_frames(following, send_buffer, &mut stream, &mut me.actions.task);
 
         // Given that the stream has been initialized, it should not be in the
         // closed state.
@@ -481,6 +536,8 @@ impl Inner {
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
             priorities_once: config.priorities_once,
+            unknown_frames: config.unknown_frames,
+            frame_log: config.frame_log,
         }))
     }
 
@@ -1463,7 +1520,15 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_response(cx, &mut stream)
+        me.actions
+            .recv
+            .poll_response(cx, &mut stream)
+            .map_ok(|mut response| {
+                if let Some(sent) = stream.sent_headers.take() {
+                    response.extensions_mut().insert(sent);
+                }
+                response
+            })
     }
 
     /// Called by a client to check for informational responses (1xx status codes)

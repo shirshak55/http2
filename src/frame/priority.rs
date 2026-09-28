@@ -84,6 +84,14 @@ impl Priority {
         // +---------------+
         self.dependency.encode(dst);
     }
+
+    pub(crate) fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub(crate) fn dependency(&self) -> StreamDependency {
+        self.dependency
+    }
 }
 
 impl<B> From<Priority> for Frame<B> {
@@ -134,6 +142,15 @@ impl StreamDependency {
         }
         dst.put_u32(dependency_id);
         dst.put_u8(self.weight);
+    }
+
+    /// The fields as a [`StreamPriority`](crate::ext::StreamPriority).
+    pub(crate) fn to_ext(self) -> crate::ext::StreamPriority {
+        crate::ext::StreamPriority {
+            dependency: self.dependency_id.into(),
+            weight: self.weight,
+            exclusive: self.is_exclusive,
+        }
     }
 }
 

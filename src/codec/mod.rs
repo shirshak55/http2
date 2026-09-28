@@ -59,6 +59,11 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    /// Logs every frame sent but DATA to `log`.
+    pub(crate) fn set_frame_log(&mut self, log: crate::ext::FrameLog) {
+        self.framed_write().set_frame_log(log)
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

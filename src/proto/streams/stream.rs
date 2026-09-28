@@ -1,3 +1,4 @@
+use crate::ext::HeadersFrame;
 use crate::{tracing, Reason};
 
 use super::*;
@@ -114,6 +115,9 @@ pub(super) struct Stream {
 
     /// Validate content-length headers
     pub content_length: ContentLength,
+
+    /// How the request's HEADERS frame was sent, when recording frames
+    pub sent_headers: Option<HeadersFrame>,
 }
 
 /// State related to validating a stream's content-length
@@ -194,6 +198,7 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
+            sent_headers: None,
         }
     }
 
@@ -441,6 +446,7 @@ impl fmt::Debug for Stream {
                 &self.pending_push_promises,
             )
             .field("content_length", &self.content_length)
+            .h2_field_some("sent_headers", &self.sent_headers)
             .finish()
     }
 }
