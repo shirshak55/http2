@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{FrameLog, HeaderOrder, Protocol, UnknownFrame};
+use crate::ext::{FrameLog, HeaderOrder, PrefaceFrame, Protocol};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
@@ -181,6 +181,34 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 pub struct SendRequest<B: Buf> {
     inner: proto::Streams<B, Peer>,
     pending: Option<proto::OpaqueStreamRef>,
+}
+
+/// Sends frames of the caller's choosing on a live HTTP/2 client connection (see
+/// [`SendRequest::control`]); the connection's task sends them when it next runs, and
+/// they end with the connection.
+#[derive(Clone, Debug)]
+pub struct Control(proto::Control);
+
+impl Control {
+    /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, once
+    /// every SETTINGS frame sent before was acknowledged; the known parameters apply to
+    /// the connection when the peer acknowledges it, as its own do.
+    pub fn send_settings(&self, params: impl IntoIterator<Item = (u16, u32)>) {
+        let mut frame = Settings::default();
+        frame.set_wire(params.into_iter().collect());
+        self.0.send_settings(frame);
+    }
+
+    /// Sends a PING carrying `payload`. Its acknowledgement is ignored.
+    pub fn send_ping(&self, payload: [u8; 8]) {
+        self.0.send_ping(payload);
+    }
+
+    /// Sets the WINDOW_UPDATE policy of the connection and of the streams opened from
+    /// now on, as [`Builder::window_update_thresholds`] does.
+    pub fn set_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
+        self.0.set_window_update_thresholds(connection, stream);
+    }
 }
 
 /// Returns a `SendRequest` instance once it is ready to send at least one
@@ -359,14 +387,15 @@ pub struct Builder {
     /// Priority stream list
     priorities: Option<Priorities>,
 
-    /// Send the priority stream list ahead of the first request only
-    priorities_once: bool,
-
     /// The exact SETTINGS parameters to send, in place of `settings`' own
     settings_frame: Option<Vec<(u16, u32)>>,
 
-    /// Frames of undefined types to send ahead of the first request's HEADERS
-    unknown_frames: Vec<UnknownFrame>,
+    /// Frames to send right ahead of the first request's HEADERS
+    preface_frames: Vec<PrefaceFrame>,
+
+    /// The unclaimed capacity the connection's and the streams' WINDOW_UPDATEs wait for
+    connection_window_threshold: Option<u32>,
+    stream_window_threshold: Option<u32>,
 
     /// How many of its frames each connection logs, when recording them
     frame_log_limit: Option<usize>,
@@ -381,6 +410,12 @@ impl<B> SendRequest<B>
 where
     B: Buf,
 {
+    /// A handle sending frames of the caller's choosing on this connection while it
+    /// lives: SETTINGS, PINGs, and the WINDOW_UPDATE policy.
+    pub fn control(&self) -> Control {
+        Control(self.inner.control())
+    }
+
     /// Returns `Ready` when the connection can initialize a new HTTP/2
     /// stream.
     ///
@@ -693,9 +728,10 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
-            priorities_once: false,
             settings_frame: None,
-            unknown_frames: Vec::new(),
+            preface_frames: Vec::new(),
+            connection_window_threshold: None,
+            stream_window_threshold: None,
             frame_log_limit: None,
         }
     }
@@ -1264,15 +1300,6 @@ impl Builder {
         self
     }
 
-    /// Sends the [`priorities`](Self::priorities) PRIORITY frames once, ahead of the
-    /// connection's first request, rather than ahead of every request.
-    ///
-    /// Default is false.
-    pub fn priorities_once(&mut self, enabled: bool) -> &mut Self {
-        self.priorities_once = enabled;
-        self
-    }
-
     /// Sends exactly `params` as the connection preface's SETTINGS frame: each
     /// `(identifier, value)` in order, unknown identifiers and repeats included.
     ///
@@ -1297,21 +1324,37 @@ impl Builder {
         self
     }
 
-    /// Sends `frames`, of types HTTP/2 doesn't define (such as GREASE types), once: ahead
-    /// of the connection's first request's HEADERS frame, right after its
-    /// [`priorities`](Self::priorities) PRIORITY frames. Each is sent as given, stream
-    /// identifier included.
+    /// Sends `frames` once, in order, after the SETTINGS frame and right before the first
+    /// request's HEADERS frame, encoded with it so that nothing comes between: connection
+    /// WINDOW_UPDATEs (the connection's receive window grows by each increment, so the
+    /// [target window](Self::initial_connection_window_size) should leave it be), PRIORITY
+    /// frames, numbered as the first request's
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id) says, and
+    /// frames of types HTTP/2 doesn't define, sent as given.
     ///
     /// # Panics
     ///
-    /// This function panics if a payload is longer than a frame can carry (2^24 - 1
-    /// octets).
-    pub fn unknown_frames(&mut self, frames: impl IntoIterator<Item = UnknownFrame>) -> &mut Self {
-        self.unknown_frames = frames.into_iter().collect();
-        assert!(self
-            .unknown_frames
-            .iter()
-            .all(|frame| frame.payload.len() <= MAX_MAX_FRAME_SIZE as usize));
+    /// This function panics if an undefined frame's payload is longer than a frame can
+    /// carry (2^24 - 1 octets).
+    pub fn preface_frames(&mut self, frames: impl IntoIterator<Item = PrefaceFrame>) -> &mut Self {
+        self.preface_frames = frames.into_iter().collect();
+        assert!(self.preface_frames.iter().all(|frame| match frame {
+            PrefaceFrame::Unknown(frame) => frame.payload.len() <= MAX_MAX_FRAME_SIZE as usize,
+            _ => true,
+        }));
+        self
+    }
+
+    /// Sends a WINDOW_UPDATE once `connection`, for the connection, or `stream`, for a
+    /// stream, bytes of received data were released since the last one, rather than once
+    /// half the window was; `None` keeps half the window.
+    pub fn window_update_thresholds(
+        &mut self,
+        connection: Option<u32>,
+        stream: Option<u32>,
+    ) -> &mut Self {
+        self.connection_window_threshold = connection;
+        self.stream_window_threshold = stream;
         self
     }
 
@@ -1523,8 +1566,9 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
-                priorities_once: builder.priorities_once,
-                unknown_frames: builder.unknown_frames,
+                preface_frames: builder.preface_frames,
+                connection_window_threshold: builder.connection_window_threshold,
+                stream_window_threshold: builder.stream_window_threshold,
                 frame_log,
                 settings: builder.settings,
             },

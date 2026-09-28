@@ -1,8 +1,8 @@
 use h2::ext::{
-    FollowingFrame, HeadersFrame, HeadersFrameOptions, LoggedFrame, PseudoHeader, StreamPriority,
-    UnknownFrame,
+    FollowingFrame, HeadersFrame, HeadersFrameOptions, LoggedFrame, PrefaceFrame, PseudoHeader,
+    StreamPriority, UnknownFrame,
 };
-use h2::frame::{Priorities, Priority, PseudoId, PseudoOrder, StreamDependency};
+use h2::frame::{Priority, PseudoId, PseudoOrder, StreamDependency};
 use h2_support::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -66,32 +66,46 @@ fn with_following(mut request: Request<()>, following: Vec<FollowingFrame>) -> R
     request
 }
 
-fn priority_on_3() -> Priorities {
-    Priorities::builder()
-        .push(Priority::new(
-            3.into(),
-            StreamDependency::new(0.into(), 200, false),
-        ))
-        .build()
+fn priority_frame(stream: u32, dependency: u32, weight: u8, exclusive: bool) -> Priority {
+    Priority::new(
+        stream.into(),
+        StreamDependency::new(dependency.into(), weight, exclusive),
+    )
+}
+
+fn recorded(stream_id: u32, options: HeadersFrameOptions) -> Request<()> {
+    let mut request = get();
+    request.extensions_mut().insert(HeadersFrameOptions {
+        recorded_stream_id: Some(stream_id),
+        ..options
+    });
+    request
 }
 
 #[tokio::test]
-async fn unknown_frames_sent_once_before_first_headers() {
+async fn preface_frames_sent_in_order_before_first_headers_and_renumbered() {
     h2_support::trace_init!();
     let (io, mut srv) = tokio::io::duplex(1 << 20);
 
     let srv = async move {
         accept(&mut srv).await;
-        // Each request's PRIORITY frame, then the unknown frames right ahead of the
-        // first request's HEADERS, which still goes out before the second's.
-        let frames = read_frames(&mut srv, 6).await;
-        let priority = (2, 0, 3, vec![0, 0, 0, 0, 200]);
-        assert_eq!(frames[0], priority);
-        assert_eq!(frames[1], priority);
-        assert_eq!(frames[2], (0x0b, 0x1, 0, vec![1, 2, 3]));
-        assert_eq!(frames[3], (0xfa, 0x0, 9, vec![]));
-        assert_eq!((frames[4].0, frames[4].2), (1, 5));
-        assert_eq!((frames[5].0, frames[5].2), (1, 7));
+        let frames = read_frames(&mut srv, 10).await;
+        // The preface frames as given, right before the first HEADERS: PRIORITY on the
+        // idle stream 3 as it is, and on the first request's own stream.
+        assert_eq!(frames[0], (8, 0, 0, 100u32.to_be_bytes().to_vec()));
+        assert_eq!(frames[1], (2, 0, 3, vec![0, 0, 0, 0, 200]));
+        assert_eq!(frames[2], (0x0a, 0x0, 0, vec![1, 2, 3]));
+        assert_eq!(frames[3], (8, 0, 0, 5u32.to_be_bytes().to_vec()));
+        assert_eq!(frames[4], (2, 0, 5, vec![0x80, 0, 0, 3, 99]));
+        assert_eq!((frames[5].0, frames[5].2), (1, 5));
+        // The second request, recorded as stream 9, opens 7: its leading PRIORITY on the
+        // recorded 11 goes to 9, depending on it; its HEADERS depends on the first
+        // request's stream; its following PRIORITY names it.
+        assert_eq!(frames[6], (2, 0, 9, vec![0, 0, 0, 7, 49]));
+        assert_eq!((frames[7].0, frames[7].1, frames[7].2), (1, 0x25, 7));
+        assert_eq!(&frames[7].3[..5], &[0, 0, 0, 5, 15]);
+        assert_eq!(frames[8], (2, 0, 7, vec![0, 0, 0, 3, 7]));
+        assert_eq!((frames[9].0, frames[9].2), (0x0b, 7));
         send_response(&mut srv, 5, true).await;
         send_response(&mut srv, 7, true).await;
         srv
@@ -100,26 +114,42 @@ async fn unknown_frames_sent_once_before_first_headers() {
     let h2 = async move {
         let (mut client, mut h2) = client::Builder::new()
             .initial_stream_id(5)
-            .priorities(priority_on_3())
-            .unknown_frames([
-                UnknownFrame {
-                    kind: 0x0b,
-                    flags: 0x1,
+            .preface_frames([
+                PrefaceFrame::WindowUpdate(100),
+                PrefaceFrame::Priority(priority_frame(3, 0, 200, false)),
+                PrefaceFrame::Unknown(UnknownFrame {
+                    kind: 0x0a,
+                    flags: 0,
                     stream_id: 0,
                     payload: Bytes::from_static(&[1, 2, 3]),
-                },
-                UnknownFrame {
-                    kind: 0xfa,
-                    flags: 0x0,
-                    stream_id: 9,
-                    payload: Bytes::new(),
-                },
+                }),
+                PrefaceFrame::WindowUpdate(5),
+                PrefaceFrame::Priority(priority_frame(5, 3, 99, true)),
             ])
             .handshake::<_, Bytes>(io)
             .await
             .unwrap();
-        let (first, _) = client.send_request(get(), true).unwrap();
-        let (second, _) = client.send_request(get(), true).unwrap();
+        let (first, _) = client
+            .send_request(recorded(5, HeadersFrameOptions::default()), true)
+            .unwrap();
+        let second = recorded(
+            9,
+            HeadersFrameOptions {
+                priority: Some(StreamDependency::new(5.into(), 15, false)),
+                leading: vec![priority_frame(11, 9, 49, false)],
+                following: vec![
+                    FollowingFrame::Priority(priority_frame(9, 3, 7, false)),
+                    FollowingFrame::Unknown {
+                        kind: 0x0b,
+                        flags: 0,
+                        on_stream: true,
+                        payload: Bytes::new(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let (second, _) = client.send_request(second, true).unwrap();
         h2.drive(first).await.unwrap();
         h2.drive(second).await.unwrap();
     };
@@ -128,38 +158,117 @@ async fn unknown_frames_sent_once_before_first_headers() {
 }
 
 #[tokio::test]
-async fn priorities_once_sent_before_first_headers_in_stream_order() {
+async fn control_sends_settings_and_ping_on_live_connection() {
     h2_support::trace_init!();
     let (io, mut srv) = tokio::io::duplex(1 << 20);
 
     let srv = async move {
         accept(&mut srv).await;
-        // The PRIORITY frame once, right ahead of the first request's HEADERS, which
-        // still goes out before the second's.
-        let frames = read_frames(&mut srv, 3).await;
-        assert_eq!(frames[0], (2, 0, 3, vec![0, 0, 0, 0, 200]));
-        assert_eq!((frames[1].0, frames[1].2), (1, 5));
-        assert_eq!((frames[2].0, frames[2].2), (1, 7));
-        send_response(&mut srv, 5, true).await;
-        send_response(&mut srv, 7, true).await;
+        let frames = read_frames(&mut srv, 1).await;
+        assert_eq!((frames[0].0, frames[0].2), (1, 1));
+        send_response(&mut srv, 1, true).await;
+        // The live SETTINGS (past the preface's ACK) and PING.
+        let mut settings = read_frame(&mut srv).await;
+        while settings.0 == 4 && settings.1 == 1 {
+            settings = read_frame(&mut srv).await;
+        }
+        assert_eq!(settings, (4, 0, 0, vec![0, 4, 0, 0x10, 0, 0]));
+        let ping = read_frame(&mut srv).await;
+        assert_eq!(ping, (6, 0, 0, vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        srv.write_all(frames::SETTINGS_ACK).await.unwrap();
+        srv.write_all(&[0, 0, 8, 6, 1, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+            .await
+            .unwrap();
+        // The connection still serves requests.
+        let frames = read_frames(&mut srv, 1).await;
+        assert_eq!((frames[0].0, frames[0].2), (1, 3));
+        send_response(&mut srv, 3, true).await;
         srv
     };
 
     let h2 = async move {
         let (mut client, mut h2) = client::Builder::new()
-            .initial_stream_id(5)
-            .priorities(priority_on_3())
-            .priorities_once(true)
             .handshake::<_, Bytes>(io)
             .await
             .unwrap();
-        let (first, _) = client.send_request(get(), true).unwrap();
-        let (second, _) = client.send_request(get(), true).unwrap();
-        h2.drive(first).await.unwrap();
-        h2.drive(second).await.unwrap();
+        let (response, _) = client.send_request(get(), true).unwrap();
+        h2.drive(response).await.unwrap();
+        let control = client.control();
+        control.send_settings([(4, 1_048_576)]);
+        control.send_ping([1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut client = h2.drive(client.ready()).await.unwrap();
+        let (response, _) = client.send_request(get(), true).unwrap();
+        h2.drive(response).await.unwrap();
     };
 
     join(srv, h2).await;
+}
+
+/// The stream WINDOW_UPDATE increments a client sends while it downloads 256 KiB on one
+/// stream, with `threshold` as its stream threshold.
+async fn stream_window_updates(threshold: Option<u32>) -> Vec<u32> {
+    let (io, mut srv) = tokio::io::duplex(1 << 20);
+    let srv = async move {
+        accept(&mut srv).await;
+        read_frames(&mut srv, 1).await;
+        send_response(&mut srv, 1, false).await;
+        // One DATA frame at a time, collecting the updates the client sends for it.
+        let mut updates = Vec::new();
+        for sent in 0..16 {
+            let flags = if sent == 15 { 0x1 } else { 0x0 };
+            srv.write_all(&[0x00, 0x40, 0x00, 0, flags, 0, 0, 0, 1])
+                .await
+                .unwrap();
+            srv.write_all(&[0; 16_384]).await.unwrap();
+            // After the last the client may be gone.
+            while sent < 15 {
+                let Ok(frame) =
+                    tokio::time::timeout(Duration::from_millis(100), read_frame(&mut srv)).await
+                else {
+                    break;
+                };
+                if frame.0 == 8 && frame.2 == 1 {
+                    updates.push(u32::from_be_bytes([
+                        frame.3[0], frame.3[1], frame.3[2], frame.3[3],
+                    ]));
+                }
+            }
+        }
+        updates
+    };
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .initial_connection_window_size(1 << 20)
+            .window_update_thresholds(None, threshold)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async move { h2.await.unwrap() });
+        let (response, _) = client.send_request(get(), true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+    };
+    join(srv, h2).await.0
+}
+
+#[tokio::test]
+async fn window_update_threshold_sets_stream_update_cadence() {
+    h2_support::trace_init!();
+    let default = stream_window_updates(None).await;
+    assert!(
+        !default.is_empty() && default.iter().all(|&increment| increment == 32_768),
+        "{:?}",
+        default
+    );
+    let small = stream_window_updates(Some(16_384)).await;
+    assert!(
+        small.len() > default.len() && small.iter().all(|&increment| increment == 16_384),
+        "{:?}",
+        small
+    );
 }
 
 #[tokio::test]
@@ -317,15 +426,17 @@ async fn record_frames_logs_sent_frames_and_request_headers() {
         let (mut client, mut h2) = client::Builder::new()
             .record_frames(16)
             .settings_frame(params.clone())
-            .initial_connection_window_size(15_728_640)
             .initial_stream_id(5)
-            .priorities(priority_on_3())
-            .unknown_frames([UnknownFrame {
-                kind: 0x0b,
-                flags: 0x0,
-                stream_id: 0,
-                payload: Bytes::from_static(&[7]),
-            }])
+            .preface_frames([
+                PrefaceFrame::WindowUpdate(15_663_105),
+                PrefaceFrame::Priority(priority_frame(3, 0, 200, false)),
+                PrefaceFrame::Unknown(UnknownFrame {
+                    kind: 0x0b,
+                    flags: 0x0,
+                    stream_id: 0,
+                    payload: Bytes::from_static(&[7]),
+                }),
+            ])
             .headers_pseudo_order(
                 PseudoOrder::builder()
                     .extend([

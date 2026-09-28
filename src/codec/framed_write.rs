@@ -353,6 +353,10 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                         stream_id: f.stream_id().into(),
                         priority: f.dependency().to_ext(),
                     },
+                    frame::Leading::WindowUpdate(f) => LoggedFrame::WindowUpdate {
+                        stream_id: f.stream_id().into(),
+                        increment: f.size_increment(),
+                    },
                     frame::Leading::Unknown(f) => unknown_frame(f),
                 });
             }

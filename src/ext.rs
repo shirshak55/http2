@@ -1,6 +1,6 @@
 //! Extensions specific to the HTTP/2 protocol.
 
-use crate::frame::{PseudoOrder, StreamDependency};
+use crate::frame::{Priority, PseudoOrder, StreamDependency};
 use crate::hpack::BytesStr;
 
 use bytes::Bytes;
@@ -84,12 +84,31 @@ pub struct HeadersFrameOptions {
     /// without the PRIORITY flag.
     pub priority: Option<StreamDependency>,
     /// The id the request's stream had on the connection `priority` was recorded on, whose
-    /// stream ids its dependency names: it then depends on the stream this connection
-    /// opened for the request recorded with that id, or on none (the root) when no such
-    /// request was sent here yet.
+    /// stream ids its dependency and the PRIORITY frames of `leading` and `following` name:
+    /// the recorded request's own id names the stream opened here, a request's recorded
+    /// earlier names the stream opened here for it (the root when none was), ids below
+    /// the first request's recorded here name the same idle streams, and ids above the
+    /// request's own lie as far above the stream opened here.
     pub recorded_stream_id: Option<u32>,
+    /// PRIORITY frames to send right before the HEADERS frame, in order.
+    pub leading: Vec<Priority>,
     /// Frames to send right after the HEADERS frame, in order, before any DATA.
     pub following: Vec<FollowingFrame>,
+}
+
+/// A frame a client connection sends once, after its SETTINGS and right before its first
+/// request's HEADERS, in the order given; see
+/// [`preface_frames`](crate::client::Builder::preface_frames).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrefaceFrame {
+    /// A connection WINDOW_UPDATE; the connection's receive window grows by the increment.
+    WindowUpdate(u32),
+    /// A PRIORITY frame, its streams numbered as on the connection the first request was
+    /// recorded on (see [`HeadersFrameOptions::recorded_stream_id`]).
+    Priority(Priority),
+    /// A frame of a type HTTP/2 doesn't define, sent as given.
+    Unknown(UnknownFrame),
 }
 
 /// A frame to send right after a request's HEADERS frame; see
@@ -101,6 +120,9 @@ pub enum FollowingFrame {
     /// increment (so the peer may send that much more, and the automatic window-update
     /// policy then works from the larger window).
     WindowUpdate(u32),
+    /// A PRIORITY frame, its streams numbered as the request's
+    /// [`recorded_stream_id`](HeadersFrameOptions::recorded_stream_id) says.
+    Priority(Priority),
     /// A frame of a type HTTP/2 doesn't define, on the request's stream when `on_stream`,
     /// else on stream 0, sent as given.
     Unknown {
@@ -116,7 +138,7 @@ pub enum FollowingFrame {
 }
 
 /// A frame of a type HTTP/2 doesn't define, such as a GREASE type, to send as given; see
-/// [`unknown_frames`](crate::client::Builder::unknown_frames).
+/// [`PrefaceFrame::Unknown`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownFrame {
     /// The frame type.

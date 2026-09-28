@@ -1531,8 +1531,9 @@ where
                             headers_stream_dependency: None,
                             headers_pseudo_order: None,
                             priorities: None,
-                            priorities_once: false,
-                            unknown_frames: Vec::new(),
+                            preface_frames: Vec::new(),
+                            connection_window_threshold: None,
+                            stream_window_threshold: None,
                             frame_log: None,
                         },
                     );

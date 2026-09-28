@@ -20,6 +20,9 @@ pub(super) struct Recv {
     /// Connection level flow control governing received data
     flow: FlowControl,
 
+    /// The unclaimed capacity a stream WINDOW_UPDATE waits for, when set
+    stream_threshold: Option<WindowSize>,
+
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
 
@@ -94,10 +97,12 @@ impl Recv {
         flow.inc_window(DEFAULT_INITIAL_WINDOW_SIZE)
             .expect("invalid initial remote window size");
         flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
+        flow.set_threshold(config.connection_window_threshold);
 
         Recv {
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             flow,
+            stream_threshold: config.stream_window_threshold,
             in_flight_data: 0 as WindowSize,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
@@ -116,6 +121,30 @@ impl Recv {
     /// Returns the initial receive window size
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz
+    }
+
+    /// The unclaimed capacity a new stream's WINDOW_UPDATE waits for, when set.
+    pub fn stream_threshold(&self) -> Option<WindowSize> {
+        self.stream_threshold
+    }
+
+    /// Sets the unclaimed capacity the connection's WINDOW_UPDATEs and those of the
+    /// streams opened from now on wait for; `None` is half the window.
+    pub fn set_window_update_thresholds(
+        &mut self,
+        connection: Option<WindowSize>,
+        stream: Option<WindowSize>,
+    ) {
+        self.flow.set_threshold(connection);
+        self.stream_threshold = stream;
+    }
+
+    /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
+    /// own announces, leaving the unclaimed capacity as is.
+    pub fn inc_connection_window(&mut self, increment: WindowSize) -> Result<(), UserError> {
+        self.flow
+            .inc_recv_window(increment)
+            .map_err(|_| UserError::InvalidWindowUpdate)
     }
 
     /// Returns the ID of the last processed stream

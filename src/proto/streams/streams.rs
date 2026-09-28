@@ -20,8 +20,8 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, Protocol,
-        UnknownFrame,
+        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, PrefaceFrame,
+        Protocol,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -102,11 +102,11 @@ struct Inner {
     /// Priority of the headers stream
     priorities: Option<Priorities>,
 
-    /// Send `priorities` ahead of the first request only
-    priorities_once: bool,
+    /// Frames to send right ahead of the first request's HEADERS
+    preface_frames: Vec<PrefaceFrame>,
 
-    /// Frames of undefined types to send ahead of the first request's HEADERS
-    unknown_frames: Vec<UnknownFrame>,
+    /// Frames to send on the live connection (see [`Control`]), in order
+    control: VecDeque<ControlFrame>,
 
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
@@ -205,6 +205,26 @@ where
         let mut me = self.inner.lock();
         let me = &mut *me;
         me.actions.recv.send_pending_refusal(cx, dst)
+    }
+
+    /// Takes the next frame to send on the live connection (see [`Control`]); a SETTINGS
+    /// frame, and those queued after it, only once `settings_synced`.
+    pub fn take_control(&mut self, settings_synced: bool) -> Option<ControlFrame> {
+        let mut me = self.inner.lock();
+        match me.control.front()? {
+            ControlFrame::Settings(_) if !settings_synced => None,
+            _ => me.control.pop_front(),
+        }
+    }
+
+    /// Puts back a frame [`Self::take_control`] took but couldn't send yet.
+    pub fn untake_control(&mut self, frame: ControlFrame) {
+        self.inner.lock().control.push_front(frame);
+    }
+
+    /// A handle sending frames on this connection while it lives (see [`Control`]).
+    pub fn control(&self) -> Control {
+        Control(Arc::clone(&self.inner))
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -311,6 +331,9 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+        stream
+            .recv_flow
+            .set_threshold(me.actions.recv.stream_threshold());
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -329,39 +352,84 @@ where
         }
 
         // Convert the message
-        let (pseudo_order, stream_dependency, following) = match headers_frame {
+        let recorded = headers_frame
+            .as_ref()
+            .and_then(|frame| frame.recorded_stream_id);
+        let renumber = |me: &Inner, priority: frame::Priority| match recorded {
+            Some(recorded) => me.renumber_priority(priority, recorded, stream_id),
+            None => priority,
+        };
+        let (pseudo_order, stream_dependency, leading, following) = match headers_frame {
             Some(frame) => (
                 frame
                     .pseudo_order
                     .or_else(|| me.headers_pseudo_order.clone()),
-                match frame.recorded_stream_id {
-                    Some(recorded) => {
-                        let priority = frame.priority.map(|priority| {
-                            let dependency = u32::from(priority.dependency_id());
-                            let renumbered = me
-                                .recorded_streams
-                                .iter()
-                                .rev()
-                                .find(|(id, _)| *id == dependency)
-                                .map_or(StreamId::ZERO, |(_, opened)| *opened);
-                            priority.depending_on(renumbered)
-                        });
-                        if me.recorded_streams.len() == RECORDED_STREAMS {
-                            me.recorded_streams.pop_front();
-                        }
-                        me.recorded_streams.push_back((recorded, stream_id));
-                        priority
-                    }
-                    None => frame.priority,
-                },
+                frame.priority.map(|priority| match recorded {
+                    Some(recorded) => priority.depending_on(me.renumber(
+                        priority.dependency_id().into(),
+                        recorded,
+                        stream_id,
+                    )),
+                    None => priority,
+                }),
+                frame.leading,
                 frame.following,
             ),
             None => (
                 me.headers_pseudo_order.clone(),
                 me.headers_stream_dependency,
                 Vec::new(),
+                Vec::new(),
             ),
         };
+        // The connection's first request carries the preface frames, numbered as the
+        // first request recorded.
+        let mut leading_frames = Vec::new();
+        for frame in std::mem::take(&mut me.preface_frames) {
+            leading_frames.push(match frame {
+                PrefaceFrame::WindowUpdate(increment) => {
+                    me.actions.recv.inc_connection_window(increment)?;
+                    frame::Leading::WindowUpdate(frame::WindowUpdate::new(
+                        StreamId::ZERO,
+                        increment,
+                    ))
+                }
+                PrefaceFrame::Priority(priority) => {
+                    frame::Leading::Priority(renumber(&me, priority))
+                }
+                PrefaceFrame::Unknown(f) => {
+                    if f.payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
+                        return Err(UserError::PayloadTooBig.into());
+                    }
+                    frame::Leading::Unknown(frame::Unknown::new(
+                        f.kind,
+                        f.flags,
+                        f.stream_id,
+                        f.payload,
+                    ))
+                }
+            });
+        }
+        leading_frames.extend(
+            leading
+                .into_iter()
+                .map(|priority| frame::Leading::Priority(renumber(&me, priority))),
+        );
+        let following: Vec<FollowingFrame> = following
+            .into_iter()
+            .map(|frame| match frame {
+                FollowingFrame::Priority(priority) => {
+                    FollowingFrame::Priority(renumber(&me, priority))
+                }
+                frame => frame,
+            })
+            .collect();
+        if let Some(recorded) = recorded {
+            if me.recorded_streams.len() == RECORDED_STREAMS {
+                me.recorded_streams.pop_front();
+            }
+            me.recorded_streams.push_back((recorded, stream_id));
+        }
         let mut headers = client::Peer::convert_send_message(
             stream_id,
             request,
@@ -382,6 +450,7 @@ where
                         .map_err(|_| UserError::InvalidWindowUpdate)?;
                     Ok(frame::WindowUpdate::new(stream_id, increment).into())
                 }
+                FollowingFrame::Priority(priority) => Ok(priority.into()),
                 FollowingFrame::Unknown {
                     kind,
                     flags,
@@ -408,29 +477,11 @@ where
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        // Frames sent once go out encoded with the first request's HEADERS, so a second
-        // request queued before the connection runs still opens after it.
-        let (priorities, once) = if me.priorities_once {
-            (None, me.priorities.take())
-        } else {
-            (me.priorities.clone(), None)
-        };
-        headers.set_leading(
-            once.into_iter()
-                .flatten()
-                .map(frame::Leading::Priority)
-                .chain(std::mem::take(&mut me.unknown_frames).into_iter().map(|f| {
-                    frame::Leading::Unknown(frame::Unknown::new(
-                        f.kind,
-                        f.flags,
-                        f.stream_id,
-                        f.payload,
-                    ))
-                }))
-                .collect(),
-        );
+        // Leading frames go out encoded with the HEADERS, so nothing comes between, and a
+        // second request queued before the connection runs still opens after the first.
+        headers.set_leading(leading_frames);
         let sent = me.actions.send.send_priority_and_headers(
-            priorities,
+            me.priorities.clone(),
             headers,
             send_buffer,
             &mut stream,
@@ -558,7 +609,108 @@ impl<B> DynStreams<'_, B> {
     }
 }
 
+/// Sends frames of the caller's choosing on a live connection: queues them for the
+/// connection's task, which sends them when it runs.
+#[derive(Clone)]
+pub(crate) struct Control(Arc<Mutex<Inner>>);
+
+/// A frame queued by a [`Control`].
+#[derive(Debug)]
+pub(crate) enum ControlFrame {
+    Settings(frame::Settings),
+    Ping([u8; 8]),
+}
+
+impl fmt::Debug for Control {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("Control").finish_non_exhaustive()
+    }
+}
+
+impl Control {
+    /// Queues a SETTINGS frame; it goes once every earlier one was acknowledged.
+    pub(crate) fn send_settings(&self, frame: frame::Settings) {
+        let mut me = self.0.lock();
+        me.control.push_back(ControlFrame::Settings(frame));
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+
+    /// Queues a PING carrying `payload`.
+    pub(crate) fn send_ping(&self, payload: [u8; 8]) {
+        let mut me = self.0.lock();
+        me.control.push_back(ControlFrame::Ping(payload));
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+
+    /// Sets the unclaimed capacity the connection's WINDOW_UPDATEs and those of the
+    /// streams opened from now on wait for; `None` is half the window.
+    pub(crate) fn set_window_update_thresholds(
+        &self,
+        connection: Option<WindowSize>,
+        stream: Option<WindowSize>,
+    ) {
+        let mut me = self.0.lock();
+        me.actions
+            .recv
+            .set_window_update_thresholds(connection, stream);
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+}
+
 impl Inner {
+    /// The stream this connection uses for `id`, a stream as the connection a request was
+    /// recorded on numbered it, where that request (`recorded`) is sent as `opened` (see
+    /// [`HeadersFrameOptions::recorded_stream_id`]).
+    fn renumber(&self, id: u32, recorded: u32, opened: StreamId) -> StreamId {
+        if id == 0 {
+            return StreamId::ZERO;
+        }
+        if id == recorded {
+            return opened;
+        }
+        if id > recorded {
+            return StreamId::from(
+                (id - recorded).saturating_add(opened.into()) & u32::from(StreamId::MAX),
+            );
+        }
+        let first = self
+            .recorded_streams
+            .front()
+            .map_or(recorded, |(id, _)| *id);
+        if id < first {
+            return StreamId::from(id);
+        }
+        self.recorded_streams
+            .iter()
+            .rev()
+            .find(|(recorded, _)| *recorded == id)
+            .map_or(StreamId::ZERO, |(_, opened)| *opened)
+    }
+
+    /// `priority` with its stream and dependency renumbered (see [`Self::renumber`]).
+    fn renumber_priority(
+        &self,
+        priority: frame::Priority,
+        recorded: u32,
+        opened: StreamId,
+    ) -> frame::Priority {
+        let dependency = priority.dependency();
+        frame::Priority::new(
+            self.renumber(priority.stream_id().into(), recorded, opened),
+            dependency.depending_on(self.renumber(
+                dependency.dependency_id().into(),
+                recorded,
+                opened,
+            )),
+        )
+    }
+
     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
             counts: Counts::new(peer, &config),
@@ -573,8 +725,8 @@ impl Inner {
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
-            priorities_once: config.priorities_once,
-            unknown_frames: config.unknown_frames,
+            preface_frames: config.preface_frames,
+            control: VecDeque::new(),
             frame_log: config.frame_log,
             recorded_streams: VecDeque::new(),
         }))

@@ -47,6 +47,9 @@ pub struct FlowControl {
     /// This can go negative if a user declares a smaller target window than
     /// the peer knows about.
     available: Window,
+
+    /// The unclaimed capacity a WINDOW_UPDATE waits for, instead of half the window.
+    threshold: Option<WindowSize>,
 }
 
 impl FlowControl {
@@ -54,7 +57,14 @@ impl FlowControl {
         FlowControl {
             window_size: Window(0),
             available: Window(0),
+            threshold: None,
         }
+    }
+
+    /// Sends a WINDOW_UPDATE once `threshold` bytes of capacity are unclaimed rather than
+    /// half the window; `None` goes back to half the window.
+    pub fn set_threshold(&mut self, threshold: Option<WindowSize>) {
+        self.threshold = threshold;
     }
 
     /// Returns the window size as known by the peer
@@ -99,7 +109,10 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
-        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+        let threshold = self.threshold.map_or(
+            self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR,
+            |threshold| threshold.min(MAX_WINDOW_SIZE) as i32,
+        );
 
         if unclaimed < threshold {
             None

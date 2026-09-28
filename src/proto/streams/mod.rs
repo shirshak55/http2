@@ -14,7 +14,9 @@ mod sync;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
-pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+pub(crate) use self::streams::{
+    Control, ControlFrame, DynStreams, OpaqueStreamRef, StreamRef, Streams,
+};
 
 use self::buffer::Buffer;
 use self::counts::Counts;
@@ -26,7 +28,7 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::ext::{FrameLog, UnknownFrame};
+use crate::ext::{FrameLog, PrefaceFrame};
 use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
@@ -84,11 +86,12 @@ pub struct Config {
     /// Priorities stream
     pub priorities: Option<Priorities>,
 
-    /// Send the priorities ahead of the first request only
-    pub priorities_once: bool,
+    /// Frames to send right ahead of the first request's HEADERS
+    pub preface_frames: Vec<PrefaceFrame>,
 
-    /// Frames of undefined types to send ahead of the first request's HEADERS
-    pub unknown_frames: Vec<UnknownFrame>,
+    /// The unclaimed capacity the connection's and the streams' WINDOW_UPDATEs wait for
+    pub connection_window_threshold: Option<WindowSize>,
+    pub stream_window_threshold: Option<WindowSize>,
 
     /// Logs the frames sent, when recording them
     pub frame_log: Option<FrameLog>,

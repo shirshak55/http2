@@ -88,6 +88,11 @@ impl Settings {
         }
     }
 
+    /// Whether no SETTINGS frame of ours awaits sending or its acknowledgement.
+    pub(crate) fn is_synced(&self) -> bool {
+        matches!(self.local, Local::Synced)
+    }
+
     pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
         assert!(!frame.is_ack());
         match &self.local {

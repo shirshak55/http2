@@ -1,5 +1,5 @@
 use crate::codec::UserError;
-use crate::ext::{FrameLog, UnknownFrame};
+use crate::ext::{FrameLog, PrefaceFrame};
 use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
@@ -88,8 +88,9 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
-    pub priorities_once: bool,
-    pub unknown_frames: Vec<UnknownFrame>,
+    pub preface_frames: Vec<PrefaceFrame>,
+    pub connection_window_threshold: Option<WindowSize>,
+    pub stream_window_threshold: Option<WindowSize>,
     pub frame_log: Option<FrameLog>,
 }
 
@@ -134,8 +135,9 @@ where
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
-                priorities_once: config.priorities_once,
-                unknown_frames: config.unknown_frames.clone(),
+                preface_frames: config.preface_frames.clone(),
+                connection_window_threshold: config.connection_window_threshold,
+                stream_window_threshold: config.stream_window_threshold,
                 frame_log: config.frame_log.clone(),
             }
         }
@@ -209,6 +211,42 @@ where
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
+        ready!(self
+            .inner
+            .settings
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+        // The caller's frames, in order: a SETTINGS frame goes once the previous one was
+        // acknowledged.
+        while let Some(frame) = self
+            .inner
+            .streams
+            .take_control(self.inner.settings.is_synced())
+        {
+            match frame {
+                ControlFrame::Settings(frame) => {
+                    self.inner
+                        .settings
+                        .send_settings(frame)
+                        .expect("no SETTINGS pending");
+                    ready!(self.inner.settings.poll_send(
+                        cx,
+                        &mut self.codec,
+                        &mut self.inner.streams
+                    ))?;
+                }
+                ControlFrame::Ping(payload) => {
+                    if !self.codec.poll_ready(cx)?.is_ready() {
+                        self.inner
+                            .streams
+                            .untake_control(ControlFrame::Ping(payload));
+                        return Poll::Pending;
+                    }
+                    self.codec
+                        .buffer(frame::Ping::new(payload).into())
+                        .expect("invalid ping frame");
+                }
+            }
+        }
         ready!(self
             .inner
             .settings
