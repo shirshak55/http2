@@ -1,5 +1,6 @@
 //! Extensions specific to the HTTP/2 protocol.
 
+use crate::frame::{PseudoOrder, StreamDependency};
 use crate::hpack::BytesStr;
 
 use bytes::Bytes;
@@ -68,3 +69,17 @@ impl fmt::Debug for Protocol {
 /// [`SendStream::send_trailers_with_order`]: crate::SendStream::send_trailers_with_order
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);
+
+/// How to send the HEADERS frame of the request carrying it, in place of the connection's
+/// [`headers_pseudo_order`] and [`headers_stream_dependency`].
+///
+/// [`headers_pseudo_order`]: crate::client::Builder::headers_pseudo_order
+/// [`headers_stream_dependency`]: crate::client::Builder::headers_stream_dependency
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadersFrameOptions {
+    /// The pseudo-header fields' order; `None` keeps the connection's.
+    pub pseudo_order: Option<PseudoOrder>,
+    /// The priority fields (dependency, weight, exclusive flag); `None` sends the frame
+    /// without the PRIORITY flag.
+    pub priority: Option<StreamDependency>,
+}

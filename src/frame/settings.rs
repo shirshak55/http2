@@ -236,6 +236,8 @@ pub struct Settings {
     experimental_settings: Option<ExperimentalSettings>,
     // Settings order
     settings_order: SettingsOrder,
+    /// The exact parameters to encode, when set by `set_wire`.
+    wire: Option<Vec<(u16, u32)>>,
 }
 
 /// A struct representing a single HTTP/2 setting that can be sent in a SETTINGS
@@ -355,6 +357,30 @@ impl Settings {
         self.settings_order = settings_order;
     }
 
+    /// Encodes exactly `params`, `(identifier, value)` in order, unknown identifiers and
+    /// repeats included, and takes the known parameters' values from them, the last of a
+    /// repeated one winning, leaving the others unset.
+    pub fn set_wire(&mut self, params: Vec<(u16, u32)>) {
+        *self = Settings {
+            flags: self.flags,
+            ..Settings::default()
+        };
+        for &(id, value) in &params {
+            match SettingId::from(id) {
+                SettingId::HeaderTableSize => self.header_table_size = Some(value),
+                SettingId::EnablePush => self.enable_push = Some(value),
+                SettingId::MaxConcurrentStreams => self.max_concurrent_streams = Some(value),
+                SettingId::InitialWindowSize => self.initial_window_size = Some(value),
+                SettingId::MaxFrameSize => self.max_frame_size = Some(value),
+                SettingId::MaxHeaderListSize => self.max_header_list_size = Some(value),
+                SettingId::EnableConnectProtocol => self.enable_connect_protocol = Some(value),
+                SettingId::NoRfc7540Priorities => self.no_rfc7540_priorities = Some(value),
+                SettingId::Unknown(_) => {}
+            }
+        }
+        self.wire = Some(params);
+    }
+
     pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
         debug_assert_eq!(head.kind(), crate::frame::Kind::Settings);
 
@@ -447,6 +473,9 @@ impl Settings {
     }
 
     fn payload_len(&self) -> usize {
+        if let Some(wire) = &self.wire {
+            return wire.len() * 6;
+        }
         let mut len = 0;
         self.for_each(|_| len += 6);
         len
@@ -460,6 +489,15 @@ impl Settings {
         tracing::trace!("encoding SETTINGS; len={}", payload_len);
 
         head.encode(payload_len, dst);
+
+        if let Some(wire) = &self.wire {
+            for &(id, value) in wire {
+                tracing::trace!("encoding setting; id={id:#x} val={value}");
+                dst.put_u16(id);
+                dst.put_u32(value);
+            }
+            return;
+        }
 
         // Encode the settings
         self.for_each(|setting| {

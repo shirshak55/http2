@@ -82,6 +82,9 @@ pub struct Config {
 
     /// Priorities stream
     pub priorities: Option<Priorities>,
+
+    /// Send the priorities ahead of the first request only
+    pub priorities_once: bool,
 }
 
 trait DebugStructExt<'a, 'b> {

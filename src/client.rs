@@ -358,6 +358,12 @@ pub struct Builder {
 
     /// Priority stream list
     priorities: Option<Priorities>,
+
+    /// Send the priority stream list ahead of the first request only
+    priorities_once: bool,
+
+    /// The exact SETTINGS parameters to send, in place of `settings`' own
+    settings_frame: Option<Vec<(u16, u32)>>,
 }
 
 #[derive(Debug)]
@@ -681,6 +687,8 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            priorities_once: false,
+            settings_frame: None,
         }
     }
 
@@ -1248,6 +1256,39 @@ impl Builder {
         self
     }
 
+    /// Sends the [`priorities`](Self::priorities) PRIORITY frames once, ahead of the
+    /// connection's first request, rather than ahead of every request.
+    ///
+    /// Default is false.
+    pub fn priorities_once(&mut self, enabled: bool) -> &mut Self {
+        self.priorities_once = enabled;
+        self
+    }
+
+    /// Sends exactly `params` as the connection preface's SETTINGS frame: each
+    /// `(identifier, value)` in order, unknown identifiers and repeats included.
+    ///
+    /// The connection then behaves as the frame says: the known parameters it carries
+    /// replace those set by [`header_table_size`], [`enable_push`],
+    /// [`max_concurrent_streams`], [`initial_window_size`], [`max_frame_size`],
+    /// [`max_header_list_size`], [`enable_connect_protocol`] and
+    /// [`no_rfc7540_priorities`], the ones it leaves out keep their protocol defaults,
+    /// and [`settings_order`] no longer applies.
+    ///
+    /// [`header_table_size`]: Self::header_table_size
+    /// [`enable_push`]: Self::enable_push
+    /// [`max_concurrent_streams`]: Self::max_concurrent_streams
+    /// [`initial_window_size`]: Self::initial_window_size
+    /// [`max_frame_size`]: Self::max_frame_size
+    /// [`max_header_list_size`]: Self::max_header_list_size
+    /// [`enable_connect_protocol`]: Self::enable_connect_protocol
+    /// [`no_rfc7540_priorities`]: Self::no_rfc7540_priorities
+    /// [`settings_order`]: Self::settings_order
+    pub fn settings_frame(&mut self, params: impl IntoIterator<Item = (u16, u32)>) -> &mut Self {
+        self.settings_frame = Some(params.into_iter().collect());
+        self
+    }
+
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
@@ -1401,9 +1442,13 @@ where
 {
     async fn handshake2(
         mut io: T,
-        builder: Builder,
+        mut builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
         bind_connection(&mut io).await?;
+
+        if let Some(params) = builder.settings_frame.take() {
+            builder.settings.set_wire(params);
+        }
 
         // Create the codec
         let mut codec = Codec::new(io);
@@ -1434,6 +1479,7 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                priorities_once: builder.priorities_once,
                 settings: builder.settings,
             },
         );

@@ -87,6 +87,7 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+    pub priorities_once: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +131,7 @@ where
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
+                priorities_once: config.priorities_once,
             }
         }
         let streams = Streams::new(streams_config(&config));

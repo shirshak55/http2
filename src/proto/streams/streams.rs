@@ -18,7 +18,7 @@ use super::{
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
-    ext::{HeaderOrder, Protocol},
+    ext::{HeaderOrder, HeadersFrameOptions, Protocol},
     frame::{self, Frame, Reason},
     proto,
     proto::{peer, Error, Initiator, Open, Peer, WindowSize},
@@ -97,6 +97,9 @@ struct Inner {
 
     /// Priority of the headers stream
     priorities: Option<Priorities>,
+
+    /// Send `priorities` ahead of the first request only
+    priorities_once: bool,
 }
 
 #[derive(Debug)]
@@ -247,6 +250,7 @@ where
 
         let protocol = request.extensions_mut().remove::<Protocol>();
         let order = request.extensions_mut().remove::<HeaderOrder>();
+        let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -307,20 +311,37 @@ where
         }
 
         // Convert the message
+        let (pseudo_order, stream_dependency) = match headers_frame {
+            Some(frame) => (
+                frame
+                    .pseudo_order
+                    .or_else(|| me.headers_pseudo_order.clone()),
+                frame.priority,
+            ),
+            None => (
+                me.headers_pseudo_order.clone(),
+                me.headers_stream_dependency,
+            ),
+        };
         let headers = client::Peer::convert_send_message(
             stream_id,
             request,
             protocol,
             order,
             end_of_stream,
-            me.headers_pseudo_order.clone(),
-            me.headers_stream_dependency,
+            pseudo_order,
+            stream_dependency,
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
+        let priorities = if me.priorities_once {
+            me.priorities.take()
+        } else {
+            me.priorities.clone()
+        };
         let sent = me.actions.send.send_priority_and_headers(
-            me.priorities.clone(),
+            priorities,
             headers,
             send_buffer,
             &mut stream,
@@ -459,6 +480,7 @@ impl Inner {
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
+            priorities_once: config.priorities_once,
         }))
     }
 
