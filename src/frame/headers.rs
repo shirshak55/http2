@@ -1,4 +1,4 @@
-use super::{util, StreamDependency, StreamId, Unknown};
+use super::{util, Priority, StreamDependency, StreamId, Unknown};
 use crate::ext::{HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
@@ -36,8 +36,25 @@ pub struct Headers {
     /// The associated flags
     flags: HeadersFlag,
 
-    /// Frames of undefined types to send right ahead of this one
-    leading: Vec<Unknown>,
+    /// Frames to send right ahead of this one
+    leading: Vec<Leading>,
+}
+
+/// A frame sent right ahead of a HEADERS frame, encoded with it so that no other
+/// stream's frames come between.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Leading {
+    Priority(Priority),
+    Unknown(Unknown),
+}
+
+impl Leading {
+    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
+        match self {
+            Self::Priority(frame) => frame.encode(dst),
+            Self::Unknown(frame) => frame.encode(dst),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -412,15 +429,15 @@ impl Headers {
     }
 
     /// Sends `frames` right ahead of this frame.
-    pub(crate) fn set_leading(&mut self, frames: Vec<Unknown>) {
+    pub(crate) fn set_leading(&mut self, frames: Vec<Leading>) {
         self.leading = frames;
     }
 
-    pub(crate) fn leading(&self) -> &[Unknown] {
+    pub(crate) fn leading(&self) -> &[Leading] {
         &self.leading
     }
 
-    pub(crate) fn take_leading(&mut self) -> Vec<Unknown> {
+    pub(crate) fn take_leading(&mut self) -> Vec<Leading> {
         std::mem::take(&mut self.leading)
     }
 

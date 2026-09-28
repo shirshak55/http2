@@ -348,7 +348,13 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
         },
         Frame::Headers(f) => {
             for frame in f.leading() {
-                log.push(unknown_frame(frame));
+                log.push(match frame {
+                    frame::Leading::Priority(f) => LoggedFrame::Priority {
+                        stream_id: f.stream_id().into(),
+                        priority: f.dependency().to_ext(),
+                    },
+                    frame::Leading::Unknown(f) => unknown_frame(f),
+                });
             }
             LoggedFrame::Headers {
                 stream_id: f.stream_id().into(),

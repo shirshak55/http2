@@ -380,15 +380,25 @@ where
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        let priorities = if me.priorities_once {
-            me.priorities.take()
+        // Frames sent once go out encoded with the first request's HEADERS, so a second
+        // request queued before the connection runs still opens after it.
+        let (priorities, once) = if me.priorities_once {
+            (None, me.priorities.take())
         } else {
-            me.priorities.clone()
+            (me.priorities.clone(), None)
         };
         headers.set_leading(
-            std::mem::take(&mut me.unknown_frames)
-                .into_iter()
-                .map(|f| frame::Unknown::new(f.kind, f.flags, f.stream_id, f.payload))
+            once.into_iter()
+                .flatten()
+                .map(frame::Leading::Priority)
+                .chain(std::mem::take(&mut me.unknown_frames).into_iter().map(|f| {
+                    frame::Leading::Unknown(frame::Unknown::new(
+                        f.kind,
+                        f.flags,
+                        f.stream_id,
+                        f.payload,
+                    ))
+                }))
                 .collect(),
         );
         let sent = me.actions.send.send_priority_and_headers(

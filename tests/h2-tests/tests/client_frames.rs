@@ -128,6 +128,41 @@ async fn unknown_frames_sent_once_before_first_headers() {
 }
 
 #[tokio::test]
+async fn priorities_once_sent_before_first_headers_in_stream_order() {
+    h2_support::trace_init!();
+    let (io, mut srv) = tokio::io::duplex(1 << 20);
+
+    let srv = async move {
+        accept(&mut srv).await;
+        // The PRIORITY frame once, right ahead of the first request's HEADERS, which
+        // still goes out before the second's.
+        let frames = read_frames(&mut srv, 3).await;
+        assert_eq!(frames[0], (2, 0, 3, vec![0, 0, 0, 0, 200]));
+        assert_eq!((frames[1].0, frames[1].2), (1, 5));
+        assert_eq!((frames[2].0, frames[2].2), (1, 7));
+        send_response(&mut srv, 5, true).await;
+        send_response(&mut srv, 7, true).await;
+        srv
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(5)
+            .priorities(priority_on_3())
+            .priorities_once(true)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let (first, _) = client.send_request(get(), true).unwrap();
+        let (second, _) = client.send_request(get(), true).unwrap();
+        h2.drive(first).await.unwrap();
+        h2.drive(second).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
 async fn following_window_update_sent_after_headers_grows_stream_window() {
     h2_support::trace_init!();
     let (io, mut srv) = tokio::io::duplex(1 << 20);
