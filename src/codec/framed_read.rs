@@ -1,4 +1,4 @@
-use crate::ext::{FrameLog, LoggedFrame};
+use crate::ext::{FrameLog, LoggedFrame, PrefaceRecorder, ReceivedPreface};
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -38,6 +38,9 @@ pub struct FramedRead<T> {
 
     /// Logs the peer's frames, when recording them.
     frame_log: Option<FrameLog>,
+
+    /// Records the peer's connection preface, until it is complete.
+    preface: Option<PrefaceRecorder>,
 }
 
 /// Partially loaded headers frame
@@ -70,12 +73,18 @@ impl<T> FramedRead<T> {
             max_continuation_frames,
             partial: None,
             frame_log: None,
+            preface: None,
         }
     }
 
     /// Logs every frame the peer sends but DATA to `log`.
     pub fn set_frame_log(&mut self, log: FrameLog) {
         self.frame_log = Some(log);
+    }
+
+    /// Records the peer's connection preface into `preface`.
+    pub fn set_received_preface(&mut self, preface: &ReceivedPreface) {
+        self.preface = Some(preface.recorder());
     }
 
     pub fn get_ref(&self) -> &T {
@@ -136,6 +145,7 @@ fn decode_frame(
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
     frame_log: Option<&FrameLog>,
+    preface: &mut Option<PrefaceRecorder>,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
     let _span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
@@ -153,8 +163,8 @@ fn decode_frame(
     let kind = head.kind();
 
     // SETTINGS as sent, unknown identifiers included, which the frame drops.
-    let settings = match (frame_log, kind) {
-        (Some(_), Kind::Settings) => Some(LoggedFrame::Settings {
+    let settings = match (frame_log.is_some() || preface.is_some(), kind) {
+        (true, Kind::Settings) => Some(LoggedFrame::Settings {
             ack: head.flag() & 0x1 == 0x1,
             params: bytes[frame::HEADER_LEN..]
                 .chunks_exact(6)
@@ -403,31 +413,49 @@ fn decode_frame(
             }
         }
         Kind::Unknown => {
-            if let Some(log) = frame_log {
+            if frame_log.is_some() || preface.is_some() {
                 let payload = Bytes::copy_from_slice(&bytes[frame::HEADER_LEN..]);
-                log.push(LoggedFrame::Unknown {
+                let unknown = LoggedFrame::Unknown {
                     kind: bytes[3],
                     flags: head.flag(),
                     stream_id: head.stream_id().into(),
                     length: payload.len() as u32,
                     payload,
-                });
+                };
+                record(frame_log, preface, Some(unknown));
             }
             // Unknown frames are ignored
             return Ok(None);
         }
     };
 
-    if let Some(log) = frame_log {
-        log_frame(log, &frame, settings);
+    if frame_log.is_some() || preface.is_some() {
+        record(frame_log, preface, logged_frame(&frame, settings));
     }
 
     Ok(Some(frame))
 }
 
-/// Logs a decoded frame.
-fn log_frame(log: &FrameLog, frame: &Frame, settings: Option<LoggedFrame>) {
-    let logged = match frame {
+/// Logs a received frame (`None` for one of a kind not logged), and records the peer's
+/// preface from it until the preface is complete.
+fn record(
+    frame_log: Option<&FrameLog>,
+    preface: &mut Option<PrefaceRecorder>,
+    logged: Option<LoggedFrame>,
+) {
+    if let Some(recorder) = preface {
+        if recorder.record(logged.as_ref()) {
+            *preface = None;
+        }
+    }
+    if let (Some(log), Some(logged)) = (frame_log, logged) {
+        log.push(logged);
+    }
+}
+
+/// A decoded frame as logged, `None` for one of a kind not logged.
+fn logged_frame(frame: &Frame, settings: Option<LoggedFrame>) -> Option<LoggedFrame> {
+    match frame {
         Frame::Settings(_) => settings,
         Frame::WindowUpdate(f) => Some(LoggedFrame::WindowUpdate {
             stream_id: f.stream_id().into(),
@@ -456,9 +484,6 @@ fn log_frame(log: &FrameLog, frame: &Frame, settings: Option<LoggedFrame>) {
             error_code: f.reason().into(),
         }),
         Frame::Data(_) | Frame::PushPromise(_) | Frame::Unknown(_) => None,
-    };
-    if let Some(logged) = logged {
-        log.push(logged);
     }
 }
 
@@ -485,6 +510,7 @@ where
                 ref mut partial,
                 max_continuation_frames,
                 ref frame_log,
+                ref mut preface,
                 ..
             } = *self;
             if let Some(frame) = decode_frame(
@@ -493,6 +519,7 @@ where
                 max_continuation_frames,
                 partial,
                 frame_log.as_ref(),
+                preface,
                 bytes,
             )? {
                 tracing::debug!(?frame, "received");

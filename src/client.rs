@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{FrameLog, HeaderOrder, PrefaceFrame, Protocol};
+use crate::ext::{FrameLog, HeaderOrder, PrefaceFrame, Protocol, ReceivedPreface};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
@@ -181,13 +181,17 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 pub struct SendRequest<B: Buf> {
     inner: proto::Streams<B, Peer>,
     pending: Option<proto::OpaqueStreamRef>,
+    preface: ReceivedPreface,
 }
 
 /// Sends frames of the caller's choosing on a live HTTP/2 client connection (see
 /// [`SendRequest::control`]); the connection's task sends them when it next runs, and
-/// they end with the connection.
+/// they end with the connection. Also tells the peer's connection preface.
 #[derive(Clone, Debug)]
-pub struct Control(proto::Control);
+pub struct Control {
+    inner: proto::Control,
+    preface: ReceivedPreface,
+}
 
 impl Control {
     /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, once
@@ -196,18 +200,24 @@ impl Control {
     pub fn send_settings(&self, params: impl IntoIterator<Item = (u16, u32)>) {
         let mut frame = Settings::default();
         frame.set_wire(params.into_iter().collect());
-        self.0.send_settings(frame);
+        self.inner.send_settings(frame);
     }
 
     /// Sends a PING carrying `payload`. Its acknowledgement is ignored.
     pub fn send_ping(&self, payload: [u8; 8]) {
-        self.0.send_ping(payload);
+        self.inner.send_ping(payload);
     }
 
     /// Sets the WINDOW_UPDATE policy of the connection and of the streams opened from
     /// now on, as [`Builder::window_update_thresholds`] does.
     pub fn set_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
-        self.0.set_window_update_thresholds(connection, stream);
+        self.inner.set_window_update_thresholds(connection, stream);
+    }
+
+    /// The peer's connection preface, resolving once the connection received all of it
+    /// (see [`ReceivedPreface`]).
+    pub fn received_preface(&self) -> ReceivedPreface {
+        self.preface.clone()
     }
 }
 
@@ -413,7 +423,10 @@ where
     /// A handle sending frames of the caller's choosing on this connection while it
     /// lives: SETTINGS, PINGs, and the WINDOW_UPDATE policy.
     pub fn control(&self) -> Control {
-        Control(self.inner.control())
+        Control {
+            inner: self.inner.control(),
+            preface: self.preface.clone(),
+        }
     }
 
     /// Returns `Ready` when the connection can initialize a new HTTP/2
@@ -638,6 +651,7 @@ where
         SendRequest {
             inner: self.inner.clone(),
             pending: None,
+            preface: self.preface.clone(),
         }
     }
 }
@@ -1552,6 +1566,8 @@ where
         if let Some(log) = &received_frame_log {
             codec.set_received_frame_log(log.clone());
         }
+        let preface = ReceivedPreface::default();
+        codec.set_received_preface(&preface);
 
         // Send initial settings frame
         codec
@@ -1582,6 +1598,7 @@ where
         let send_request = SendRequest {
             inner: inner.streams().clone(),
             pending: None,
+            preface,
         };
 
         let mut connection = Connection { inner };

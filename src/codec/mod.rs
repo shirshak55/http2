@@ -69,6 +69,11 @@ impl<T, B> Codec<T, B> {
         self.inner.set_frame_log(log)
     }
 
+    /// Records the peer's connection preface into `preface`.
+    pub(crate) fn set_received_preface(&mut self, preface: &crate::ext::ReceivedPreface) {
+        self.inner.set_received_preface(preface)
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

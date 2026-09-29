@@ -6,7 +6,10 @@ use crate::hpack::BytesStr;
 use bytes::Bytes;
 use http::HeaderName;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 /// Represents the `:protocol` pseudo-header used by
 /// the [Extended CONNECT Protocol].
@@ -199,6 +202,92 @@ impl FrameLog {
     /// How many frames were sent after the log reached its limit, and were not logged.
     pub fn dropped(&self) -> usize {
         self.lock().dropped
+    }
+}
+
+/// The connection preface a client connection's peer sent — its SETTINGS and the
+/// connection WINDOW_UPDATEs and frames of types HTTP/2 doesn't define after it — as
+/// [`LoggedFrame`]s in wire order, once the connection received all of it: the peer's
+/// SETTINGS ACK or a frame of any other kind ends it (and isn't part of it), as does the
+/// connection's end (then it holds what arrived: nothing when the peer sent no SETTINGS).
+///
+/// Resolves as soon as it is complete, ahead of any response; see
+/// [`Control::received_preface`](crate::client::Control::received_preface).
+#[derive(Clone, Debug, Default)]
+pub struct ReceivedPreface(Arc<Mutex<ReceivedPrefaceInner>>);
+
+#[derive(Debug, Default)]
+struct ReceivedPrefaceInner {
+    frames: Vec<LoggedFrame>,
+    complete: bool,
+    wakers: Vec<Waker>,
+}
+
+impl ReceivedPreface {
+    fn lock(&self) -> MutexGuard<'_, ReceivedPrefaceInner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Feeds it the frames the connection receives (see [`PrefaceRecorder`]).
+    pub(crate) fn recorder(&self) -> PrefaceRecorder {
+        PrefaceRecorder(self.clone())
+    }
+
+    fn complete(&self) {
+        let mut inner = self.lock();
+        inner.complete = true;
+        for waker in inner.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+}
+
+impl Future for ReceivedPreface {
+    type Output = Vec<LoggedFrame>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.lock();
+        if inner.complete {
+            return Poll::Ready(inner.frames.clone());
+        }
+        if !inner.wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            inner.wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+/// Records a connection's received frames into its [`ReceivedPreface`] until it is
+/// complete; dropped (the connection ended, or the preface is complete), it completes it.
+#[derive(Debug)]
+pub(crate) struct PrefaceRecorder(ReceivedPreface);
+
+impl PrefaceRecorder {
+    /// Records `frame`, received, unless it ends the preface (`None` is a frame of a kind
+    /// not logged, which does); returns whether the preface is complete.
+    pub(crate) fn record(&self, frame: Option<&LoggedFrame>) -> bool {
+        let mut inner = self.0.lock();
+        match frame {
+            Some(
+                frame @ (LoggedFrame::Settings { ack: false, .. }
+                | LoggedFrame::WindowUpdate { stream_id: 0, .. }
+                | LoggedFrame::Unknown { .. }),
+            ) => {
+                inner.frames.push(frame.clone());
+                false
+            }
+            _ => {
+                drop(inner);
+                self.0.complete();
+                true
+            }
+        }
+    }
+}
+
+impl Drop for PrefaceRecorder {
+    fn drop(&mut self) {
+        self.0.complete();
     }
 }
 
