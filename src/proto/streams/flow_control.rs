@@ -99,9 +99,12 @@ impl FlowControl {
     ///
     /// If there is no available bytes to be reclaimed, or the number of
     /// available bytes does not reach the threshold, this returns `None`.
+    /// A threshold beyond the whole window, `in_flight` bytes of which the consumer
+    /// holds, is one the unclaimed capacity never reaches: the increment is the threshold
+    /// then, growing the window (see [`Self::window_update_sent`]).
     ///
     /// This represents pending outbound WINDOW_UPDATE frames.
-    pub fn unclaimed_capacity(&self) -> Option<WindowSize> {
+    pub fn unclaimed_capacity(&self, in_flight: WindowSize) -> Option<WindowSize> {
         let available = self.available;
 
         if self.window_size >= available {
@@ -114,7 +117,10 @@ impl FlowControl {
             |threshold| threshold.min(MAX_WINDOW_SIZE) as i32,
         );
 
-        if unclaimed < threshold {
+        if i64::from(threshold) > i64::from(available.0) + i64::from(in_flight) {
+            let room = MAX_WINDOW_SIZE as i32 - self.window_size.0;
+            Some(threshold.min(room).max(unclaimed) as WindowSize)
+        } else if unclaimed < threshold {
             None
         } else {
             Some(unclaimed as WindowSize)
@@ -144,6 +150,19 @@ impl FlowControl {
 
         self.window_size = Window(val);
         Ok(())
+    }
+
+    /// Records a WINDOW_UPDATE of `incr`, [`Self::unclaimed_capacity`]'s, sent: whatever
+    /// of it the unclaimed capacity doesn't cover grows the window.
+    pub fn window_update_sent(&mut self, incr: WindowSize) -> Result<(), Reason> {
+        let unclaimed = self.available.0 - self.window_size.0;
+        if let Some(grown) = (incr as i32)
+            .checked_sub(unclaimed)
+            .filter(|grown| *grown > 0)
+        {
+            self.available.increase_by(grown as WindowSize)?;
+        }
+        self.inc_window(incr)
     }
 
     /// Increase the recv-side window size, leaving the unclaimed capacity as is.

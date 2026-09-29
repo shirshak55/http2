@@ -480,7 +480,7 @@ impl Recv {
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if self.flow.unclaimed_capacity().is_some() {
+        if self.flow.unclaimed_capacity(self.in_flight_data).is_some() {
             if let Some(task) = task.take() {
                 task.wake();
             }
@@ -510,7 +510,11 @@ impl Recv {
         let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if stream.recv_flow.unclaimed_capacity().is_some() {
+        if stream
+            .recv_flow
+            .unclaimed_capacity(stream.in_flight_recv_data)
+            .is_some()
+        {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
@@ -585,7 +589,7 @@ impl Recv {
         // If changing the target capacity means we gained a bunch of capacity,
         // enough that we went over the update threshold, then schedule sending
         // a connection WINDOW_UPDATE.
-        if self.flow.unclaimed_capacity().is_some() {
+        if self.flow.unclaimed_capacity(self.in_flight_data).is_some() {
             if let Some(task) = task.take() {
                 task.wake();
             }
@@ -1141,7 +1145,7 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        if let Some(incr) = self.flow.unclaimed_capacity() {
+        if let Some(incr) = self.flow.unclaimed_capacity(self.in_flight_data) {
             let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
 
             // Ensure the codec has capacity
@@ -1153,7 +1157,7 @@ impl Recv {
 
             // Update flow control
             self.flow
-                .inc_window(incr)
+                .window_update_sent(incr)
                 .expect("unexpected flow control state");
         }
 
@@ -1197,7 +1201,10 @@ impl Recv {
                 }
 
                 // TODO: de-dup
-                if let Some(incr) = stream.recv_flow.unclaimed_capacity() {
+                if let Some(incr) = stream
+                    .recv_flow
+                    .unclaimed_capacity(stream.in_flight_recv_data)
+                {
                     // Create the WINDOW_UPDATE frame
                     let frame = frame::WindowUpdate::new(stream.id, incr);
 
@@ -1208,7 +1215,7 @@ impl Recv {
                     // Update flow control
                     stream
                         .recv_flow
-                        .inc_window(incr)
+                        .window_update_sent(incr)
                         .expect("unexpected flow control state");
                 }
             })

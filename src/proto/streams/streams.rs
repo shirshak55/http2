@@ -119,6 +119,9 @@ struct Inner {
     recorded_streams: VecDeque<(u32, StreamId)>,
 }
 
+/// The PRIORITY_UPDATE frame type (RFC 9218).
+const PRIORITY_UPDATE: u8 = 0x10;
+
 /// How many of the streams opened for requests carrying their recorded stream id are
 /// kept, to renumber the dependencies of the requests after them.
 const RECORDED_STREAMS: usize = 256;
@@ -425,6 +428,20 @@ where
                 FollowingFrame::Priority(priority) => {
                     FollowingFrame::Priority(renumber(&me, priority))
                 }
+                FollowingFrame::Unknown {
+                    kind: PRIORITY_UPDATE,
+                    flags,
+                    on_stream: false,
+                    payload,
+                } => FollowingFrame::Unknown {
+                    kind: PRIORITY_UPDATE,
+                    flags,
+                    on_stream: false,
+                    payload: match recorded {
+                        Some(recorded) => me.renumber_priority_update(payload, recorded, stream_id),
+                        None => payload,
+                    },
+                },
                 frame => frame,
             })
             .collect();
@@ -624,6 +641,19 @@ pub(crate) struct Control(Arc<Mutex<Inner>>);
 pub(crate) enum ControlFrame {
     Settings(frame::Settings),
     Ping([u8; 8]),
+    Priority(frame::Priority),
+    Unknown(frame::Unknown),
+}
+
+impl<B> From<ControlFrame> for Frame<B> {
+    fn from(frame: ControlFrame) -> Self {
+        match frame {
+            ControlFrame::Settings(settings) => settings.into(),
+            ControlFrame::Ping(payload) => frame::Ping::new(payload).into(),
+            ControlFrame::Priority(priority) => priority.into(),
+            ControlFrame::Unknown(unknown) => unknown.into(),
+        }
+    }
 }
 
 impl fmt::Debug for Control {
@@ -635,20 +665,49 @@ impl fmt::Debug for Control {
 impl Control {
     /// Queues a SETTINGS frame, whatever SETTINGS sent before await acknowledgement.
     pub(crate) fn send_settings(&self, frame: frame::Settings) {
-        let mut me = self.0.lock();
-        me.control.push_back(ControlFrame::Settings(frame));
-        if let Some(task) = me.actions.task.take() {
-            task.wake();
-        }
+        self.0.lock().queue_control(ControlFrame::Settings(frame));
     }
 
     /// Queues a PING carrying `payload`.
     pub(crate) fn send_ping(&self, payload: [u8; 8]) {
+        self.0.lock().queue_control(ControlFrame::Ping(payload));
+    }
+
+    /// Queues `priority`, its streams numbered as the connection requests were recorded on
+    /// numbered them, renumbered as [`Inner::recorded_stream`] does; a dependency on a
+    /// stream this connection lacks is on the root instead, and a stream it lacks gets none.
+    pub(crate) fn send_priority(&self, priority: frame::Priority) {
         let mut me = self.0.lock();
-        me.control.push_back(ControlFrame::Ping(payload));
-        if let Some(task) = me.actions.task.take() {
-            task.wake();
-        }
+        let Some(stream_id) = me.recorded_stream(priority.stream_id().into()) else {
+            return;
+        };
+        let dependency = priority.dependency();
+        let dependency_id = me
+            .recorded_stream(dependency.dependency_id().into())
+            .unwrap_or(StreamId::ZERO);
+        me.queue_control(ControlFrame::Priority(frame::Priority::new(
+            stream_id,
+            dependency.depending_on(dependency_id),
+        )));
+    }
+
+    /// Queues a PRIORITY_UPDATE frame (RFC 9218) giving `stream_id`, numbered as the
+    /// connection requests were recorded on numbered it, the priority `field_value`,
+    /// renumbered as [`Inner::recorded_stream`] does; none for a stream this connection lacks.
+    pub(crate) fn send_priority_update(&self, stream_id: u32, field_value: &[u8]) {
+        let mut me = self.0.lock();
+        let Some(stream_id) = me.recorded_stream(stream_id) else {
+            return;
+        };
+        let mut payload = Vec::with_capacity(4 + field_value.len());
+        payload.extend_from_slice(&u32::from(stream_id).to_be_bytes());
+        payload.extend_from_slice(field_value);
+        me.queue_control(ControlFrame::Unknown(frame::Unknown::new(
+            PRIORITY_UPDATE,
+            0,
+            0,
+            payload.into(),
+        )));
     }
 
     /// Sets the unclaimed capacity the connection's WINDOW_UPDATEs and those of the
@@ -669,6 +728,30 @@ impl Control {
 }
 
 impl Inner {
+    /// Queues `frame` for the connection's task, waking it.
+    fn queue_control(&mut self, frame: ControlFrame) {
+        self.control.push_back(frame);
+        if let Some(task) = self.actions.task.take() {
+            task.wake();
+        }
+    }
+
+    /// The stream this connection uses for `id`, a stream as the connection requests were
+    /// recorded on numbered it: that of the request recorded as `id` (see
+    /// [`HeadersFrameOptions::recorded_stream_id`]), or `id` itself below the first such
+    /// request's, a stream only PRIORITY frames name; `None` for a stream of another request.
+    fn recorded_stream(&self, id: u32) -> Option<StreamId> {
+        let (first, _) = self.recorded_streams.front()?;
+        if id < *first {
+            return Some(StreamId::from(id));
+        }
+        self.recorded_streams
+            .iter()
+            .rev()
+            .find(|(recorded, _)| *recorded == id)
+            .map(|(_, opened)| *opened)
+    }
+
     /// The stream this connection uses for `id`, a stream as the connection a request was
     /// recorded on numbered it, where that request (`recorded`) is sent as `opened` (see
     /// [`HeadersFrameOptions::recorded_stream_id`]).
@@ -696,6 +779,18 @@ impl Inner {
             .rev()
             .find(|(recorded, _)| *recorded == id)
             .map_or(StreamId::ZERO, |(_, opened)| *opened)
+    }
+
+    /// `payload`, a PRIORITY_UPDATE frame's, with its prioritized stream renumbered (see
+    /// [`Self::renumber`]).
+    fn renumber_priority_update(&self, payload: Bytes, recorded: u32, opened: StreamId) -> Bytes {
+        if payload.len() < 4 {
+            return payload;
+        }
+        let mut field_value = payload;
+        let id = field_value.get_u32() & u32::from(StreamId::MAX);
+        let id = u32::from(self.renumber(id, recorded, opened));
+        [&id.to_be_bytes()[..], &field_value[..]].concat().into()
     }
 
     /// `priority` with its stream and dependency renumbered (see [`Self::renumber`]).

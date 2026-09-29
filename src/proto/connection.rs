@@ -230,16 +230,14 @@ where
                         &mut self.inner.streams
                     ))?;
                 }
-                ControlFrame::Ping(payload) => {
+                frame => {
                     if !self.codec.poll_ready(cx)?.is_ready() {
-                        self.inner
-                            .streams
-                            .untake_control(ControlFrame::Ping(payload));
+                        self.inner.streams.untake_control(frame);
                         return Poll::Pending;
                     }
                     self.codec
-                        .buffer(frame::Ping::new(payload).into())
-                        .expect("invalid ping frame");
+                        .buffer(frame.into())
+                        .expect("invalid control frame");
                 }
             }
         }

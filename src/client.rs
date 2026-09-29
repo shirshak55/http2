@@ -140,8 +140,8 @@ use crate::ext::{FrameLog, HeaderOrder, PrefaceFrame, Protocol, ReceivedPreface}
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
-    Headers, Priorities, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder, StreamDependency,
-    StreamId, MAX_MAX_FRAME_SIZE,
+    Headers, Priorities, Priority, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder,
+    StreamDependency, StreamId, MAX_MAX_FRAME_SIZE,
 };
 use crate::proto::{self, Error};
 use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
@@ -206,6 +206,23 @@ impl Control {
     /// Sends a PING carrying `payload`. Its acknowledgement is ignored.
     pub fn send_ping(&self, payload: [u8; 8]) {
         self.inner.send_ping(payload);
+    }
+
+    /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded
+    /// on numbered streams (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as this
+    /// connection numbers them: a stream below the first recorded request's as is, a
+    /// dependency on a request this connection didn't send on the root, and not at all for
+    /// such a request.
+    pub fn send_priority(&self, priority: Priority) {
+        self.inner.send_priority(priority);
+    }
+
+    /// Sends a PRIORITY_UPDATE frame (RFC 9218) giving `stream_id`, numbered as
+    /// [`Self::send_priority`]'s streams are, the priority `field_value`; not at all for a
+    /// request this connection didn't send.
+    pub fn send_priority_update(&self, stream_id: u32, field_value: &[u8]) {
+        self.inner.send_priority_update(stream_id, field_value);
     }
 
     /// Sets the WINDOW_UPDATE policy of the connection and of the streams opened from
