@@ -59,6 +59,11 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    /// Takes the oldest SETTINGS frame sent that the peer has yet to acknowledge.
+    pub(crate) fn take_unacked_settings(&mut self) -> Option<crate::frame::Settings> {
+        self.framed_write().take_unacked_settings()
+    }
+
     /// Logs every frame sent but DATA to `log`.
     pub(crate) fn set_frame_log(&mut self, log: crate::ext::FrameLog) {
         self.framed_write().set_frame_log(log)

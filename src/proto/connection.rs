@@ -155,7 +155,7 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 ping_pong: PingPong::new(),
-                settings: Settings::new(config.settings),
+                settings: Settings::new(),
                 streams,
                 #[cfg(feature = "tracing")]
                 span,
@@ -175,14 +175,16 @@ where
     pub(crate) fn set_initial_window_size(&mut self, size: WindowSize) -> Result<(), UserError> {
         let mut settings = frame::Settings::default();
         settings.set_initial_window_size(Some(size));
-        self.inner.settings.send_settings(settings)
+        self.inner.settings.send_settings(settings);
+        Ok(())
     }
 
     /// Send a new SETTINGS frame with extended CONNECT protocol enabled.
     pub(crate) fn set_enable_connect_protocol(&mut self) -> Result<(), UserError> {
         let mut settings = frame::Settings::default();
         settings.set_enable_connect_protocol(Some(1));
-        self.inner.settings.send_settings(settings)
+        self.inner.settings.send_settings(settings);
+        Ok(())
     }
 
     /// Returns the maximum number of concurrent streams that may be initiated
@@ -217,19 +219,11 @@ where
             .inner
             .settings
             .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
-        // The caller's frames, in order: a SETTINGS frame goes once the previous one was
-        // acknowledged.
-        while let Some(frame) = self
-            .inner
-            .streams
-            .take_control(self.inner.settings.is_synced())
-        {
+        // The caller's frames, in order.
+        while let Some(frame) = self.inner.streams.take_control() {
             match frame {
                 ControlFrame::Settings(frame) => {
-                    self.inner
-                        .settings
-                        .send_settings(frame)
-                        .expect("no SETTINGS pending");
+                    self.inner.settings.send_settings(frame);
                     ready!(self.inner.settings.poll_send(
                         cx,
                         &mut self.codec,

@@ -194,9 +194,9 @@ pub struct Control {
 }
 
 impl Control {
-    /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, once
-    /// every SETTINGS frame sent before was acknowledged; the known parameters apply to
-    /// the connection when the peer acknowledges it, as its own do.
+    /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, whatever
+    /// SETTINGS sent before await acknowledgement (RFC 9113 §6.5.3); the known parameters
+    /// apply to the connection when the peer acknowledges it, as its own do.
     pub fn send_settings(&self, params: impl IntoIterator<Item = (u16, u32)>) {
         let mut frame = Settings::default();
         frame.set_wire(params.into_iter().collect());

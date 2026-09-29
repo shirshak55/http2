@@ -1,13 +1,15 @@
-use crate::codec::UserError;
 use crate::error::Reason;
 use crate::proto::*;
 use crate::tracing;
+use std::collections::VecDeque;
 use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub(crate) struct Settings {
-    /// Our local SETTINGS sync state with the remote.
-    local: Local,
+    /// Our SETTINGS to send to the remote when the socket is ready, in order. Those sent
+    /// await their acknowledgements in the codec, which applies them in the order sent;
+    /// several may await one at once (RFC 9113 §6.5.3).
+    to_send: VecDeque<frame::Settings>,
     /// Received SETTINGS frame pending processing. The ACK must be written to
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
@@ -17,23 +19,12 @@ pub(crate) struct Settings {
     has_received_remote_initial_settings: bool,
 }
 
-#[derive(Debug)]
-enum Local {
-    /// We want to send these SETTINGS to the remote when the socket is ready.
-    ToSend(frame::Settings),
-    /// We have sent these SETTINGS and are waiting for the remote to ACK
-    /// before we apply them.
-    WaitingAck(frame::Settings),
-    /// Our local settings are in sync with the remote.
-    Synced,
-}
-
 impl Settings {
-    pub(crate) fn new(local: frame::Settings) -> Self {
+    pub(crate) fn new() -> Self {
         Settings {
-            // We assume the initial local SETTINGS were flushed during
-            // the handshake process.
-            local: Local::WaitingAck(local),
+            // The initial local SETTINGS were flushed during the handshake, through the
+            // codec, which awaits their acknowledgement.
+            to_send: VecDeque::new(),
             remote: None,
             has_received_remote_initial_settings: false,
         }
@@ -52,8 +43,8 @@ impl Settings {
         P: Peer,
     {
         if frame.is_ack() {
-            match &self.local {
-                Local::WaitingAck(local) => {
+            match codec.take_unacked_settings() {
+                Some(local) => {
                     tracing::debug!("received settings ACK; applying {:?}", local);
 
                     if let Some(max) = local.max_frame_size() {
@@ -68,11 +59,10 @@ impl Settings {
                         codec.set_recv_header_table_size(val as usize);
                     }
 
-                    streams.apply_local_settings(local)?;
-                    self.local = Local::Synced;
+                    streams.apply_local_settings(&local)?;
                     Ok(())
                 }
-                Local::ToSend(..) | Local::Synced => {
+                None => {
                     // We haven't sent any SETTINGS frames to be ACKed, so
                     // this is very bizarre! Remote is either buggy or malicious.
                     proto_err!(conn: "received unexpected settings ack");
@@ -88,21 +78,12 @@ impl Settings {
         }
     }
 
-    /// Whether no SETTINGS frame of ours awaits sending or its acknowledgement.
-    pub(crate) fn is_synced(&self) -> bool {
-        matches!(self.local, Local::Synced)
-    }
-
-    pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
+    /// Queues a SETTINGS frame to send, whatever SETTINGS sent before await their
+    /// acknowledgement.
+    pub(crate) fn send_settings(&mut self, frame: frame::Settings) {
         assert!(!frame.is_ack());
-        match &self.local {
-            Local::ToSend(..) | Local::WaitingAck(..) => Err(UserError::SendSettingsWhilePending),
-            Local::Synced => {
-                tracing::trace!("queue to send local settings: {:?}", frame);
-                self.local = Local::ToSend(frame);
-                Ok(())
-            }
-        }
+        tracing::trace!("queue to send local settings: {:?}", frame);
+        self.to_send.push_back(frame);
     }
 
     /// Sets `true` to `self.has_received_remote_initial_settings`.
@@ -153,20 +134,16 @@ impl Settings {
 
         self.remote = None;
 
-        match &self.local {
-            Local::ToSend(settings) => {
-                if !dst.poll_ready(cx)?.is_ready() {
-                    return Poll::Pending;
-                }
-
-                // Buffer the settings frame
-                dst.buffer(settings.clone().into())
-                    .expect("invalid settings frame");
-                tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
-
-                self.local = Local::WaitingAck(settings.clone());
+        while let Some(settings) = self.to_send.front() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                return Poll::Pending;
             }
-            Local::WaitingAck(..) | Local::Synced => {}
+
+            // Buffer the settings frame
+            dst.buffer(settings.clone().into())
+                .expect("invalid settings frame");
+            tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
+            self.to_send.pop_front();
         }
 
         Poll::Ready(Ok(()))

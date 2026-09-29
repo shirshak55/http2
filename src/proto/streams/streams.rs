@@ -210,14 +210,9 @@ where
         me.actions.recv.send_pending_refusal(cx, dst)
     }
 
-    /// Takes the next frame to send on the live connection (see [`Control`]); a SETTINGS
-    /// frame, and those queued after it, only once `settings_synced`.
-    pub fn take_control(&mut self, settings_synced: bool) -> Option<ControlFrame> {
-        let mut me = self.inner.lock();
-        match me.control.front()? {
-            ControlFrame::Settings(_) if !settings_synced => None,
-            _ => me.control.pop_front(),
-        }
+    /// Takes the next frame to send on the live connection (see [`Control`]).
+    pub fn take_control(&mut self) -> Option<ControlFrame> {
+        self.inner.lock().control.pop_front()
     }
 
     /// Puts back a frame [`Self::take_control`] took but couldn't send yet.
@@ -400,6 +395,12 @@ where
                 PrefaceFrame::Priority(priority) => {
                     frame::Leading::Priority(renumber(&me, priority))
                 }
+                PrefaceFrame::Settings(params) => {
+                    let mut settings = frame::Settings::default();
+                    settings.set_wire(params);
+                    frame::Leading::Settings(settings)
+                }
+                PrefaceFrame::Ping(payload) => frame::Leading::Ping(frame::Ping::new(payload)),
                 PrefaceFrame::Unknown(f) => {
                     if f.payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
                         return Err(UserError::PayloadTooBig.into());
@@ -632,7 +633,7 @@ impl fmt::Debug for Control {
 }
 
 impl Control {
-    /// Queues a SETTINGS frame; it goes once every earlier one was acknowledged.
+    /// Queues a SETTINGS frame, whatever SETTINGS sent before await acknowledgement.
     pub(crate) fn send_settings(&self, frame: frame::Settings) {
         let mut me = self.0.lock();
         me.control.push_back(ControlFrame::Settings(frame));

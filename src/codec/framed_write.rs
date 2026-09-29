@@ -5,6 +5,7 @@ use crate::frame::{self, Frame, FrameSize, StreamDependency};
 use crate::{hpack, tracing};
 
 use bytes::{Buf, BufMut, BytesMut};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -56,6 +57,10 @@ struct Encoder<B> {
 
     /// Logs the frames sent, when recording them.
     frame_log: Option<FrameLog>,
+
+    /// The SETTINGS frames sent (a request's leading ones included) that the peer has
+    /// yet to acknowledge, oldest first.
+    unacked_settings: VecDeque<frame::Settings>,
 }
 
 #[derive(Debug)]
@@ -104,6 +109,7 @@ where
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
                 frame_log: None,
+                unacked_settings: VecDeque::new(),
             },
         }
     }
@@ -265,6 +271,9 @@ where
             Frame::Headers(mut v) => {
                 for frame in v.take_leading() {
                     frame.encode(self.buf.get_mut());
+                    if let frame::Leading::Settings(settings) = frame {
+                        self.unacked_settings.push_back(settings);
+                    }
                 }
                 let mut buf = limited_write_buf!(self);
                 if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
@@ -280,6 +289,9 @@ where
             Frame::Settings(v) => {
                 v.encode(self.buf.get_mut());
                 tracing::trace!(rem = self.buf.remaining(), "encoded settings");
+                if !v.is_ack() {
+                    self.unacked_settings.push_back(v);
+                }
             }
             Frame::GoAway(v) => {
                 v.encode(self.buf.get_mut());
@@ -357,6 +369,14 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                         stream_id: f.stream_id().into(),
                         increment: f.size_increment(),
                     },
+                    frame::Leading::Settings(f) => LoggedFrame::Settings {
+                        ack: f.is_ack(),
+                        params: f.params(),
+                    },
+                    frame::Leading::Ping(f) => LoggedFrame::Ping {
+                        ack: f.is_ack(),
+                        payload: *f.payload(),
+                    },
                     frame::Leading::Unknown(f) => unknown_frame(f),
                 });
             }
@@ -396,6 +416,12 @@ fn unknown_frame(frame: &frame::Unknown) -> LoggedFrame {
 }
 
 impl<T, B> FramedWrite<T, B> {
+    /// Takes the oldest SETTINGS frame sent that the peer has yet to acknowledge, which
+    /// its next acknowledgement is for.
+    pub fn take_unacked_settings(&mut self) -> Option<frame::Settings> {
+        self.encoder.unacked_settings.pop_front()
+    }
+
     /// Returns the max frame size that can be sent
     pub fn max_frame_size(&self) -> usize {
         self.encoder.max_frame_size()

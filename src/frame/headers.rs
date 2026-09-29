@@ -1,4 +1,4 @@
-use super::{util, Priority, StreamDependency, StreamId, Unknown, WindowUpdate};
+use super::{util, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate};
 use crate::ext::{HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
@@ -46,14 +46,18 @@ pub struct Headers {
 pub(crate) enum Leading {
     Priority(Priority),
     WindowUpdate(WindowUpdate),
+    Settings(Settings),
+    Ping(Ping),
     Unknown(Unknown),
 }
 
 impl Leading {
-    pub(crate) fn encode<B: BufMut>(&self, dst: &mut B) {
+    pub(crate) fn encode(&self, dst: &mut BytesMut) {
         match self {
             Self::Priority(frame) => frame.encode(dst),
             Self::WindowUpdate(frame) => frame.encode(dst),
+            Self::Settings(frame) => frame.encode(dst),
+            Self::Ping(frame) => frame.encode(dst),
             Self::Unknown(frame) => frame.encode(dst),
         }
     }

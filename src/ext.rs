@@ -110,6 +110,11 @@ pub enum PrefaceFrame {
     /// A PRIORITY frame, its streams numbered as on the connection the first request was
     /// recorded on (see [`HeadersFrameOptions::recorded_stream_id`]).
     Priority(Priority),
+    /// A SETTINGS frame of exactly these parameters, `(identifier, value)` in order,
+    /// beyond the connection's first; the known ones apply when the peer acknowledges it.
+    Settings(Vec<(u16, u32)>),
+    /// A PING carrying this payload; its acknowledgement is ignored.
+    Ping([u8; 8]),
     /// A frame of a type HTTP/2 doesn't define, sent as given.
     Unknown(UnknownFrame),
 }
