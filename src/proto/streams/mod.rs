@@ -95,6 +95,8 @@ pub struct Config {
 
     /// Logs the frames sent, when recording them
     pub frame_log: Option<FrameLog>,
+    /// Logs the frames received, when recording them
+    pub received_frame_log: Option<FrameLog>,
 }
 
 trait DebugStructExt<'a, 'b> {

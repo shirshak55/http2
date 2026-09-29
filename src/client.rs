@@ -1361,9 +1361,10 @@ impl Builder {
     /// Records the frames each connection sends that shape its HTTP/2 fingerprint.
     ///
     /// Each connection logs the frames it sends but DATA, in wire order, up to `limit` of
-    /// them, in a [`FrameLog`], and each response carries a
-    /// [`HeadersFrame`](crate::ext::HeadersFrame) extension with its request's HEADERS
-    /// frame's stream, priority fields and pseudo-header order, and that log.
+    /// them, in a [`FrameLog`], and those it receives but DATA in another, and each
+    /// response carries a [`HeadersFrame`](crate::ext::HeadersFrame) extension with its
+    /// request's HEADERS frame's stream, priority fields and pseudo-header order, and
+    /// both logs.
     ///
     /// Not recorded by default.
     pub fn record_frames(&mut self, limit: usize) -> &mut Self {
@@ -1547,6 +1548,10 @@ where
         if let Some(log) = &frame_log {
             codec.set_frame_log(log.clone());
         }
+        let received_frame_log = builder.frame_log_limit.map(FrameLog::new);
+        if let Some(log) = &received_frame_log {
+            codec.set_received_frame_log(log.clone());
+        }
 
         // Send initial settings frame
         codec
@@ -1570,6 +1575,7 @@ where
                 connection_window_threshold: builder.connection_window_threshold,
                 stream_window_threshold: builder.stream_window_threshold,
                 frame_log,
+                received_frame_log,
                 settings: builder.settings,
             },
         );

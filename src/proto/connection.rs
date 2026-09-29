@@ -92,6 +92,7 @@ pub(crate) struct Config {
     pub connection_window_threshold: Option<WindowSize>,
     pub stream_window_threshold: Option<WindowSize>,
     pub frame_log: Option<FrameLog>,
+    pub received_frame_log: Option<FrameLog>,
 }
 
 #[derive(Debug)]
@@ -139,6 +140,7 @@ where
                 connection_window_threshold: config.connection_window_threshold,
                 stream_window_threshold: config.stream_window_threshold,
                 frame_log: config.frame_log.clone(),
+                received_frame_log: config.received_frame_log.clone(),
             }
         }
         let streams = Streams::new(streams_config(&config));

@@ -319,4 +319,7 @@ pub struct HeadersFrame {
     pub pseudo_order: Vec<PseudoHeader>,
     /// The frames its connection sent.
     pub connection: FrameLog,
+    /// The frames its connection received (the server's SETTINGS, WINDOW_UPDATE and any
+    /// other but DATA, in order).
+    pub received: FrameLog,
 }

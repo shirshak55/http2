@@ -111,6 +111,9 @@ struct Inner {
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
 
+    /// Logs the frames received, when recording them
+    received_frame_log: Option<FrameLog>,
+
     /// The streams opened for requests carrying their recorded stream id (see
     /// [`HeadersFrameOptions::recorded_stream_id`]), by that id, newest last
     recorded_streams: VecDeque<(u32, StreamId)>,
@@ -472,6 +475,7 @@ where
                 priority: headers.stream_dep().map(StreamDependency::to_ext),
                 pseudo_order: headers.encoded_pseudo_order(),
                 connection: log.clone(),
+                received: me.received_frame_log.clone().unwrap_or_else(|| log.clone()),
             });
         }
 
@@ -728,6 +732,7 @@ impl Inner {
             preface_frames: config.preface_frames,
             control: VecDeque::new(),
             frame_log: config.frame_log,
+            received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
         }))
     }

@@ -1535,6 +1535,7 @@ where
                             connection_window_threshold: None,
                             stream_window_threshold: None,
                             frame_log: None,
+                            received_frame_log: None,
                         },
                     );
 
