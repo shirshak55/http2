@@ -155,7 +155,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
 ///
@@ -1554,31 +1554,15 @@ where
 
 // ===== impl Connection =====
 
-async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    tracing::debug!("binding client connection");
-
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
-
-    tracing::debug!("client connection bound");
-
-    Ok(())
-}
-
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
     async fn handshake2(
-        mut io: T,
+        io: T,
         mut builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
-        bind_connection(&mut io).await?;
-
         if let Some(params) = builder.settings_frame.take() {
             builder.settings.set_wire(params);
         }
@@ -1604,6 +1588,10 @@ where
         }
         let preface = ReceivedPreface::default();
         codec.set_received_preface(&preface);
+
+        // The preface's opening bytes go out with the initial settings frame, in one write
+        // as clients send them.
+        codec.buffer_raw(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
         // Send initial settings frame
         codec

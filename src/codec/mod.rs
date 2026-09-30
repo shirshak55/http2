@@ -64,6 +64,11 @@ impl<T, B> Codec<T, B> {
         self.framed_write().take_unacked_settings()
     }
 
+    /// Buffers `bytes` as they are, ahead of the frames buffered next.
+    pub(crate) fn buffer_raw(&mut self, bytes: &[u8]) {
+        self.framed_write().buffer_raw(bytes)
+    }
+
     /// Logs every frame sent but DATA to `log`.
     pub(crate) fn set_frame_log(&mut self, log: crate::ext::FrameLog) {
         self.framed_write().set_frame_log(log)

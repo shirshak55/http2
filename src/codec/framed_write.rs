@@ -448,6 +448,11 @@ impl<T, B> FramedWrite<T, B> {
         self.encoder.last_data_frame.take()
     }
 
+    /// Buffers `bytes` as they are, ahead of the frames buffered next.
+    pub fn buffer_raw(&mut self, bytes: &[u8]) {
+        self.encoder.buf.get_mut().put_slice(bytes);
+    }
+
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
