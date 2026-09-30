@@ -225,6 +225,20 @@ impl Control {
         self.inner.send_priority_update(stream_id, field_value);
     }
 
+    /// Sends `frames` right before the next request's HEADERS frame, encoded with it so
+    /// that nothing comes between, after any [preface frames](Builder::preface_frames) the
+    /// first request still carries, and as those are sent.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if an undefined frame's payload is longer than a frame can
+    /// carry (2^24 - 1 octets).
+    pub fn send_before_next_request(&self, frames: impl IntoIterator<Item = PrefaceFrame>) {
+        let frames: Vec<PrefaceFrame> = frames.into_iter().collect();
+        assert!(fit(&frames));
+        self.inner.send_before_next_request(frames);
+    }
+
     /// Sets the WINDOW_UPDATE policy of the connection and of the streams opened from
     /// now on, as [`Builder::window_update_thresholds`] does.
     pub fn set_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
@@ -1369,10 +1383,7 @@ impl Builder {
     /// carry (2^24 - 1 octets).
     pub fn preface_frames(&mut self, frames: impl IntoIterator<Item = PrefaceFrame>) -> &mut Self {
         self.preface_frames = frames.into_iter().collect();
-        assert!(self.preface_frames.iter().all(|frame| match frame {
-            PrefaceFrame::Unknown(frame) => frame.payload.len() <= MAX_MAX_FRAME_SIZE as usize,
-            _ => true,
-        }));
+        assert!(fit(&self.preface_frames));
         self
     }
 
@@ -1480,6 +1491,14 @@ impl Default for Builder {
     fn default() -> Builder {
         Builder::new()
     }
+}
+
+/// Whether each of `frames` fits in a frame (see [`Builder::preface_frames`]).
+fn fit(frames: &[PrefaceFrame]) -> bool {
+    frames.iter().all(|frame| match frame {
+        PrefaceFrame::Unknown(frame) => frame.payload.len() <= MAX_MAX_FRAME_SIZE as usize,
+        _ => true,
+    })
 }
 
 /// Creates a new configured HTTP/2 client with default configuration

@@ -102,7 +102,8 @@ struct Inner {
     /// Priority of the headers stream
     priorities: Option<Priorities>,
 
-    /// Frames to send right ahead of the first request's HEADERS
+    /// Frames to send right ahead of the next request's HEADERS: the first request's
+    /// preface frames, and those a [`Control`] adds
     preface_frames: Vec<PrefaceFrame>,
 
     /// Frames to send on the live connection (see [`Control`]), in order
@@ -383,8 +384,8 @@ where
                 Vec::new(),
             ),
         };
-        // The connection's first request carries the preface frames, numbered as the
-        // first request recorded.
+        // The next request carries the frames waiting for it (the first request, the
+        // preface frames), numbered as it was recorded.
         let mut leading_frames = Vec::new();
         for frame in std::mem::take(&mut me.preface_frames) {
             leading_frames.push(match frame {
@@ -708,6 +709,12 @@ impl Control {
             0,
             payload.into(),
         )));
+    }
+
+    /// Queues `frames` to go out right ahead of the next request's HEADERS, after the
+    /// preface frames still waiting for it, as those do.
+    pub(crate) fn send_before_next_request(&self, frames: Vec<PrefaceFrame>) {
+        self.0.lock().preface_frames.extend(frames);
     }
 
     /// Sets the unclaimed capacity the connection's WINDOW_UPDATEs and those of the
