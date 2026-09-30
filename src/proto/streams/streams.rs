@@ -21,7 +21,7 @@ use crate::{
     codec::{Codec, SendError, UserError},
     ext::{
         FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions,
-        NeverIndexedPseudo, PrefaceFrame, Protocol,
+        NeverIndexedPseudo, PrefaceFrame, Protocol, RefusePushes,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -291,6 +291,7 @@ where
         let protocol = request.extensions_mut().remove::<Protocol>();
         let order = request.extensions_mut().remove::<HeaderOrder>();
         let never_indexed = request.extensions_mut().remove::<NeverIndexedPseudo>();
+        let refuse_pushes = request.extensions_mut().remove::<RefusePushes>().is_some();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
@@ -337,6 +338,7 @@ where
         stream
             .recv_flow
             .set_threshold(me.actions.recv.stream_threshold());
+        stream.refuse_pushes = refuse_pushes;
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -1199,7 +1201,7 @@ impl Inner {
         let promised_id = frame.promised_id();
 
         // First, ensure that the initiating stream is still in a valid state.
-        let parent_key = match self.store.find_mut(&id) {
+        let (parent_key, refused) = match self.store.find_mut(&id) {
             Some(stream) => {
                 // The GOAWAY process has begun. All streams with a greater ID
                 // than specified as part of GOAWAY should be ignored.
@@ -1212,13 +1214,16 @@ impl Inner {
                     return Ok(());
                 }
 
-                // The stream must be receive open
-                if !stream.state.ensure_recv_open()? {
+                // The stream must be receive open, unless reset here: a PUSH_PROMISE sent
+                // before the peer saw the reset still reserves its promised stream, which is
+                // then refused (RFC 9113 §5.1).
+                let reset = stream.state.is_local_error();
+                if !reset && !stream.state.ensure_recv_open()? {
                     proto_err!(conn: "recv_push_promise: initiating stream is not opened");
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
 
-                stream.key()
+                (stream.key(), reset || stream.refuse_pushes)
             }
             None => {
                 proto_err!(conn: "recv_push_promise: initiating stream is in an invalid state");
@@ -1264,6 +1269,10 @@ impl Inner {
                 let stream_valid = actions.recv.recv_push_promise(frame, stream);
 
                 match stream_valid {
+                    Ok(()) if refused => {
+                        maybe_cancel(stream, actions, counts);
+                        Ok(None)
+                    }
                     Ok(()) => Ok(Some(stream.key())),
                     _ => {
                         let mut send_buffer = send_buffer.inner.lock();

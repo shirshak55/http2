@@ -113,6 +113,9 @@ pub(super) struct Stream {
     /// The stream's pending push promises
     pub pending_push_promises: store::Queue<NextAccept>,
 
+    /// Whether the pushes promised on it are refused
+    pub refuse_pushes: bool,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -197,6 +200,7 @@ impl Stream {
             recv_task: None,
             push_task: None,
             pending_push_promises: store::Queue::new(),
+            refuse_pushes: false,
             content_length: ContentLength::Omitted,
             sent_headers: None,
         }
@@ -445,6 +449,7 @@ impl fmt::Debug for Stream {
                 !self.pending_push_promises.is_empty(),
                 &self.pending_push_promises,
             )
+            .h2_field_if("refuse_pushes", &self.refuse_pushes)
             .field("content_length", &self.content_length)
             .h2_field_some("sent_headers", &self.sent_headers)
             .finish()

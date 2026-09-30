@@ -74,6 +74,13 @@ impl fmt::Debug for Protocol {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);
 
+/// Refuses the pushes a server promises on the request carrying it: each promised stream is
+/// reset with `CANCEL` as its PUSH_PROMISE arrives, as a client rejects a push it doesn't
+/// want (RFC 9113 §8.4.2). For a connection whose SETTINGS allow push (an exact SETTINGS
+/// frame replayed) but which takes none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefusePushes;
+
 /// The pseudo-header fields of the request carrying it to send as never-indexed literals
 /// (RFC 7541 §6.2.3), as a field whose value is marked sensitive is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
