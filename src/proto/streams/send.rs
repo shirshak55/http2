@@ -61,6 +61,11 @@ impl Send {
         }
     }
 
+    /// The newest stream whose HEADERS went out.
+    pub fn headers_sent(&self) -> StreamId {
+        self.prioritize.headers_sent()
+    }
+
     /// Returns the initial send window size
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz

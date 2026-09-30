@@ -53,6 +53,9 @@ pub(super) struct Prioritize {
     /// Stream ID of the last stream opened.
     last_opened_id: StreamId,
 
+    /// The newest stream whose HEADERS went out.
+    headers_sent: StreamId,
+
     /// What `DATA` frame is currently being sent in the codec.
     in_flight_data_frame: InFlightData,
 
@@ -101,9 +104,15 @@ impl Prioritize {
             pending_open: store::Queue::new(),
             flow,
             last_opened_id: StreamId::ZERO,
+            headers_sent: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
         }
+    }
+
+    /// The newest stream whose HEADERS went out.
+    pub(crate) fn headers_sent(&self) -> StreamId {
+        self.headers_sent
     }
 
     pub(crate) fn max_buffer_size(&self) -> usize {
@@ -846,12 +855,17 @@ impl Prioritize {
                             }
                             Frame::PushPromise(pp)
                         }
-                        Some(frame) => frame.map(|_| {
-                            unreachable!(
-                                "Frame::map closure will only be called \
-                                 on DATA frames."
-                            )
-                        }),
+                        Some(frame) => {
+                            if let Frame::Headers(_) = frame {
+                                self.headers_sent = self.headers_sent.max(stream.id);
+                            }
+                            frame.map(|_| {
+                                unreachable!(
+                                    "Frame::map closure will only be called \
+                                     on DATA frames."
+                                )
+                            })
+                        }
                         None => {
                             if let Some(reason) = stream.state.get_scheduled_reset() {
                                 stream.set_reset(reason, Initiator::Library);

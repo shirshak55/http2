@@ -185,8 +185,13 @@ pub struct SendRequest<B: Buf> {
 }
 
 /// Sends frames of the caller's choosing on a live HTTP/2 client connection (see
-/// [`SendRequest::control`]); the connection's task sends them when it next runs, and
-/// they end with the connection. Also tells the peer's connection preface.
+/// [`SendRequest::control`]); the connection's task sends them in order when their turn
+/// comes, and they end with the connection. Also tells the peer's connection preface.
+///
+/// A frame goes out when the connection next runs, unless the handle follows a request
+/// (see [`Self::after_request`]), and right ahead of the HEADERS of any request carrying a
+/// [recorded stream id](crate::ext::HeadersFrameOptions::recorded_stream_id) past the one
+/// it follows that is sent before it goes out.
 #[derive(Clone, Debug)]
 pub struct Control {
     inner: proto::Control,
@@ -194,6 +199,17 @@ pub struct Control {
 }
 
 impl Control {
+    /// A handle whose frames follow the request recorded as `recorded` (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)): each
+    /// goes out once that request's HEADERS did, or once [`Self::release_request`] tells
+    /// it won't be sent here.
+    pub fn after_request(&self, recorded: u32) -> Self {
+        Control {
+            inner: self.inner.after_request(recorded),
+            preface: self.preface.clone(),
+        }
+    }
+
     /// Sends a SETTINGS frame of exactly `params`, `(identifier, value)` in order, whatever
     /// SETTINGS sent before await acknowledgement (RFC 9113 §6.5.3); the known parameters
     /// apply to the connection when the peer acknowledges it, as its own do.
@@ -211,9 +227,10 @@ impl Control {
     /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded
     /// on numbered streams (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as this
-    /// connection numbers them: a stream below the first recorded request's as is, a
-    /// dependency on a request this connection didn't send on the root, and not at all for
-    /// such a request.
+    /// connection numbers them when it goes out: a stream below the first recorded
+    /// request's as is, one past the latest recorded request's as far past the stream that
+    /// request went out on, a dependency on a request this connection didn't send on the
+    /// root, and not at all for such a request.
     pub fn send_priority(&self, priority: Priority) {
         self.inner.send_priority(priority);
     }
@@ -239,10 +256,27 @@ impl Control {
         self.inner.send_before_next_request(frames);
     }
 
-    /// Sets the WINDOW_UPDATE policy of the connection and of the streams opened from
-    /// now on, as [`Builder::window_update_thresholds`] does.
-    pub fn set_window_update_thresholds(&self, connection: Option<u32>, stream: Option<u32>) {
-        self.inner.set_window_update_thresholds(connection, stream);
+    /// Sends a WINDOW_UPDATE of `increment` for the connection (`stream_id` 0) or for the
+    /// request recorded as `stream_id`, numbered as [`Self::send_priority`]'s streams are;
+    /// not at all for a request this connection didn't send, or an increment its window
+    /// can't take. It grows the window by `increment`, as the capacity released does.
+    pub fn send_window_update(&self, stream_id: u32, increment: u32) {
+        self.inner.send_window_update(stream_id, increment);
+    }
+
+    /// Tells that the request recorded as `recorded` won't be sent on this connection, so
+    /// the frames following it (see [`Self::after_request`]) no longer wait for it.
+    pub fn release_request(&self, recorded: u32) {
+        self.inner.release_request(recorded);
+    }
+
+    /// Makes the receive window of the request recorded as `recorded`, if sent here, and
+    /// the connection's for the data it receives, grow only by the WINDOW_UPDATEs
+    /// [`Self::send_window_update`] sends, those of a peer that data is relayed to, rather
+    /// than by the data released. Data released otherwise, or never, as a stream closes,
+    /// still grows them.
+    pub fn mirror_stream_window(&self, recorded: u32) {
+        self.inner.mirror_stream_window(recorded);
     }
 
     /// The peer's connection preface, resolving once the connection received all of it

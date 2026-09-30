@@ -219,32 +219,8 @@ where
             .inner
             .settings
             .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
-        // The caller's frames, in order.
-        while let Some(frame) = self.inner.streams.take_control() {
-            match frame {
-                ControlFrame::Settings(frame) => {
-                    self.inner.settings.send_settings(frame);
-                    ready!(self.inner.settings.poll_send(
-                        cx,
-                        &mut self.codec,
-                        &mut self.inner.streams
-                    ))?;
-                }
-                frame => {
-                    if !self.codec.poll_ready(cx)?.is_ready() {
-                        self.inner.streams.untake_control(frame);
-                        return Poll::Pending;
-                    }
-                    self.codec
-                        .buffer(frame.into())
-                        .expect("invalid control frame");
-                }
-            }
-        }
-        ready!(self
-            .inner
-            .settings
-            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+        // The caller's frames whose turn came (see `Control`).
+        ready!(self.inner.streams.poll_control(cx, &mut self.codec))?;
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
 
         Poll::Ready(Ok(()))

@@ -50,6 +50,10 @@ pub struct FlowControl {
 
     /// The unclaimed capacity a WINDOW_UPDATE waits for, instead of half the window.
     threshold: Option<WindowSize>,
+
+    /// Whether the window grows only by the WINDOW_UPDATEs of a peer the data received is
+    /// relayed to (see [`Self::set_mirror`]).
+    mirror: bool,
 }
 
 impl FlowControl {
@@ -58,6 +62,7 @@ impl FlowControl {
             window_size: Window(0),
             available: Window(0),
             threshold: None,
+            mirror: false,
         }
     }
 
@@ -65,6 +70,19 @@ impl FlowControl {
     /// half the window; `None` goes back to half the window.
     pub fn set_threshold(&mut self, threshold: Option<WindowSize>) {
         self.threshold = threshold;
+    }
+
+    /// Makes the window grow only by the WINDOW_UPDATEs of a peer the data received is
+    /// relayed to, [`Self::inc_recv_window`]'s, rather than by the data released, which
+    /// then assigns no capacity.
+    pub fn set_mirror(&mut self) {
+        self.mirror = true;
+    }
+
+    /// Whether the window grows only by a relaying peer's WINDOW_UPDATEs (see
+    /// [`Self::set_mirror`]).
+    pub fn is_mirror(&self) -> bool {
+        self.mirror
     }
 
     /// Returns the window size as known by the peer
@@ -112,6 +130,9 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
+        if self.mirror {
+            return None;
+        }
         let threshold = self.threshold.map_or(
             self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR,
             |threshold| threshold.min(MAX_WINDOW_SIZE) as i32,

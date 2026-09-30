@@ -272,7 +272,9 @@ where
                 for frame in v.take_leading() {
                     frame.encode(self.buf.get_mut());
                     if let frame::Leading::Settings(settings) = frame {
-                        self.unacked_settings.push_back(settings);
+                        if !settings.is_ack() {
+                            self.unacked_settings.push_back(settings);
+                        }
                     }
                 }
                 let mut buf = limited_write_buf!(self);

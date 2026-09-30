@@ -128,17 +128,6 @@ impl Recv {
         self.stream_threshold
     }
 
-    /// Sets the unclaimed capacity the connection's WINDOW_UPDATEs and those of the
-    /// streams opened from now on wait for; `None` is half the window.
-    pub fn set_window_update_thresholds(
-        &mut self,
-        connection: Option<WindowSize>,
-        stream: Option<WindowSize>,
-    ) {
-        self.flow.set_threshold(connection);
-        self.stream_threshold = stream;
-    }
-
     /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
     /// own announces, leaving the unclaimed capacity as is.
     pub fn inc_connection_window(&mut self, increment: WindowSize) -> Result<(), UserError> {
@@ -500,6 +489,13 @@ impl Recv {
             return Err(UserError::ReleaseCapacityTooBig);
         }
 
+        if stream.recv_flow.is_mirror() {
+            // The peer's WINDOW_UPDATEs the data is relayed to grow the windows instead.
+            self.in_flight_data -= capacity;
+            stream.in_flight_recv_data -= capacity;
+            return Ok(());
+        }
+
         self.release_connection_capacity(capacity, task);
 
         // Decrement in-flight data
@@ -604,6 +600,10 @@ impl Recv {
     ) -> Result<(), proto::Error> {
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
             self.is_extended_connect_protocol_enabled = val;
+        }
+
+        if let Some(val) = settings.is_push_enabled() {
+            self.is_push_enabled = val;
         }
 
         if let Some(target) = settings.initial_window_size() {

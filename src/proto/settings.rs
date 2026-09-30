@@ -108,17 +108,19 @@ impl Settings {
         P: Peer,
     {
         if let Some(settings) = self.remote.clone() {
-            if !dst.poll_ready(cx)?.is_ready() {
-                return Poll::Pending;
+            if !streams.defer_settings_ack() {
+                if !dst.poll_ready(cx)?.is_ready() {
+                    return Poll::Pending;
+                }
+
+                // Create an ACK settings frame
+                let frame = frame::Settings::ack();
+
+                // Buffer the settings frame
+                dst.buffer(frame.into()).expect("invalid settings frame");
             }
 
-            // Create an ACK settings frame
-            let frame = frame::Settings::ack();
-
-            // Buffer the settings frame
-            dst.buffer(frame.into()).expect("invalid settings frame");
-
-            tracing::trace!("ACK sent; applying settings");
+            tracing::trace!("ACK sent or deferred; applying settings");
 
             let is_initial = self.mark_remote_initial_settings_as_received();
             streams.apply_remote_settings(&settings, is_initial)?;
