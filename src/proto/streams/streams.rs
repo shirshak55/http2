@@ -20,8 +20,8 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, PrefaceFrame,
-        Protocol,
+        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions,
+        NeverIndexedPseudo, PrefaceFrame, Protocol,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -290,6 +290,7 @@ where
 
         let protocol = request.extensions_mut().remove::<Protocol>();
         let order = request.extensions_mut().remove::<HeaderOrder>();
+        let never_indexed = request.extensions_mut().remove::<NeverIndexedPseudo>();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
@@ -461,6 +462,9 @@ where
             pseudo_order,
             stream_dependency,
         )?;
+        if let Some(NeverIndexedPseudo(never_indexed)) = never_indexed {
+            headers.set_never_indexed(never_indexed);
+        }
 
         let following = following
             .into_iter()

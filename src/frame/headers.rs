@@ -107,6 +107,9 @@ pub struct Pseudo {
 
     // Pseudo order
     pub order: PseudoOrder,
+
+    // Pseudo-header fields sent as never-indexed literals
+    pub never_indexed: Vec<PseudoId>,
 }
 
 define_enum_with_values! {
@@ -413,6 +416,11 @@ impl Headers {
     /// Encodes the header fields in `order`.
     pub(crate) fn set_header_order(&mut self, order: HeaderOrder) {
         self.header_block.order = order;
+    }
+
+    /// Encodes the pseudo-header fields `never_indexed` lists as never-indexed literals.
+    pub(crate) fn set_never_indexed(&mut self, never_indexed: Vec<PseudoId>) {
+        self.header_block.pseudo.never_indexed = never_indexed;
     }
 
     #[cfg(feature = "unstable")]
@@ -802,6 +810,7 @@ impl Pseudo {
             protocol,
             status: None,
             order: Default::default(),
+            never_indexed: Vec::new(),
         };
 
         // If the URI includes a scheme component, add it to the pseudo headers
@@ -827,6 +836,7 @@ impl Pseudo {
             protocol: None,
             status: Some(status),
             order: Default::default(),
+            never_indexed: Vec::new(),
         }
     }
 
@@ -919,42 +929,44 @@ impl EncodingHeaderBlock {
 // ===== impl Iter =====
 
 impl Iterator for Iter {
-    type Item = hpack::Header<Option<HeaderName>>;
+    /// A header, and whether it goes as a never-indexed literal.
+    type Item = (hpack::Header<Option<HeaderName>>, bool);
 
     fn next(&mut self) -> Option<Self::Item> {
         use crate::hpack::Header::*;
 
         if let Some(ref mut pseudo) = self.pseudo {
             for pseudo_type in &pseudo.order {
+                let never_indexed = pseudo.never_indexed.contains(pseudo_type);
                 match pseudo_type {
                     PseudoId::Method => {
                         if let Some(method) = pseudo.method.take() {
-                            return Some(Method(method));
+                            return Some((Method(method), never_indexed));
                         }
                     }
                     PseudoId::Scheme => {
                         if let Some(scheme) = pseudo.scheme.take() {
-                            return Some(Scheme(scheme));
+                            return Some((Scheme(scheme), never_indexed));
                         }
                     }
                     PseudoId::Authority => {
                         if let Some(authority) = pseudo.authority.take() {
-                            return Some(Authority(authority));
+                            return Some((Authority(authority), never_indexed));
                         }
                     }
                     PseudoId::Path => {
                         if let Some(path) = pseudo.path.take() {
-                            return Some(Path(path));
+                            return Some((Path(path), never_indexed));
                         }
                     }
                     PseudoId::Protocol => {
                         if let Some(protocol) = pseudo.protocol.take() {
-                            return Some(Protocol(protocol));
+                            return Some((Protocol(protocol), never_indexed));
                         }
                     }
                     PseudoId::Status => {
                         if let Some(status) = pseudo.status.take() {
-                            return Some(Status(status));
+                            return Some((Status(status), never_indexed));
                         }
                     }
                 }
@@ -965,7 +977,7 @@ impl Iterator for Iter {
 
         self.fields
             .next()
-            .map(|(name, value)| Field { name, value })
+            .map(|(name, value)| (Field { name, value }, false))
     }
 }
 
@@ -1220,12 +1232,13 @@ impl HeaderBlock {
             let ordered = ordered_fields(&self.fields, &self.order.0);
             (HeaderMap::new(), ordered)
         };
-        let ordered = ordered
-            .into_iter()
-            .map(|(name, value)| hpack::Header::Field {
+        let ordered = ordered.into_iter().map(|(name, value)| {
+            let field = hpack::Header::Field {
                 name: Some(name),
                 value,
-            });
+            };
+            (field, false)
+        });
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: fields.into_iter(),

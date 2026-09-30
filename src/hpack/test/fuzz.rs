@@ -164,7 +164,7 @@ impl FuzzHpack {
                 encoder.update_max_size(*resize);
             }
 
-            encoder.encode(frame.headers, &mut buf);
+            encoder.encode(frame.headers.into_iter().map(|h| (h, false)), &mut buf);
 
             // Decode the chunk!
             decoder

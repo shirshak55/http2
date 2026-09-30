@@ -1,4 +1,4 @@
-use super::table::{Index, Table};
+use super::table::{index_static, Index, Table};
 use super::{huffman, Header};
 use crate::tracing;
 
@@ -58,10 +58,11 @@ impl Encoder {
         }
     }
 
-    /// Encode a set of headers into the provide buffer
+    /// Encode a set of headers into the provide buffer; a pseudo-header marked `true` goes
+    /// as a never-indexed literal, as a field whose value is sensitive does
     pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
     where
-        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+        I: IntoIterator<Item = (Header<Option<HeaderName>>, bool)>,
     {
         let _span = tracing::trace_span!("hpack::encode");
 
@@ -69,8 +70,16 @@ impl Encoder {
 
         let mut last_index = None;
 
-        for header in headers {
+        for (header, never_indexed) in headers {
             match header.reify() {
+                // A literal naming the static table's entry, which leaves the table as is.
+                Ok(header) if never_indexed => {
+                    let value = header.value_slice();
+                    match index_static(&header) {
+                        Some((idx, _)) => encode_not_indexed(idx, value, true, dst),
+                        None => encode_not_indexed2(header.name().as_slice(), value, true, dst),
+                    }
+                }
                 // The header has an associated name. In which case, try to
                 // index it in the table.
                 Ok(header) => {
@@ -695,7 +704,7 @@ mod test {
 
     fn encode(e: &mut Encoder, hdrs: Vec<Header<Option<HeaderName>>>) -> BytesMut {
         let mut dst = BytesMut::with_capacity(1024);
-        e.encode(hdrs, &mut dst);
+        e.encode(hdrs.into_iter().map(|h| (h, false)), &mut dst);
         dst
     }
 

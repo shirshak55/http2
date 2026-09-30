@@ -1,6 +1,6 @@
 //! Extensions specific to the HTTP/2 protocol.
 
-use crate::frame::{Priority, PseudoOrder, StreamDependency};
+use crate::frame::{Priority, PseudoId, PseudoOrder, StreamDependency};
 use crate::hpack::BytesStr;
 
 use bytes::Bytes;
@@ -73,6 +73,11 @@ impl fmt::Debug for Protocol {
 /// [`SendStream::send_trailers_with_order`]: crate::SendStream::send_trailers_with_order
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);
+
+/// The pseudo-header fields of the request carrying it to send as never-indexed literals
+/// (RFC 7541 §6.2.3), as a field whose value is marked sensitive is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NeverIndexedPseudo(pub Vec<PseudoId>);
 
 /// How to send the HEADERS frame of the request carrying it, in place of the connection's
 /// [`headers_pseudo_order`] and [`headers_stream_dependency`].

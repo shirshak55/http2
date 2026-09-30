@@ -23,7 +23,7 @@ pub mod fuzz_logic {
 
     fn encode(e: &mut hpack::Encoder, hdrs: Vec<hpack::Header<Option<HeaderName>>>) -> BytesMut {
         let mut dst = BytesMut::with_capacity(1024);
-        e.encode(&mut hdrs.into_iter(), &mut dst);
+        e.encode(hdrs.into_iter().map(|h| (h, false)), &mut dst);
         dst
     }
 }

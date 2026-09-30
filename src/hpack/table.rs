@@ -132,8 +132,8 @@ impl Table {
 
     /// Index the header in the HPACK table.
     pub fn index(&mut self, header: Header) -> Index {
-        // Check the static table
-        let statik = index_static(&header);
+        // Check the static table; a sensitive header never goes by index
+        let statik = index_static(&header).map(|(idx, full)| (idx, full && !header.is_sensitive()));
 
         // Don't index certain headers. This logic is borrowed from nghttp2.
         if header.skip_value_index() {
@@ -218,8 +218,8 @@ impl Table {
             // Compute the real index into the VecDeque
             let real_idx = index.wrapping_add(self.inserted);
 
-            if self.slots[real_idx].header.value_eq(&header) {
-                // We have a full match!
+            // A full match, unless sensitive: that never goes by index
+            if self.slots[real_idx].header.value_eq(&header) && !header.is_sensitive() {
                 return Index::Indexed(real_idx + DYN_OFFSET, header);
             }
 
@@ -674,7 +674,7 @@ fn hash_header(header: &Header) -> HashValue {
 
 /// Checks the static table for the header. If found, returns the index and a
 /// boolean representing if the value matched as well.
-fn index_static(header: &Header) -> Option<(usize, bool)> {
+pub(super) fn index_static(header: &Header) -> Option<(usize, bool)> {
     match *header {
         Header::Field {
             ref name,
