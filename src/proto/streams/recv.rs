@@ -278,6 +278,8 @@ impl Recv {
                 .pending_recv
                 .push_back(&mut self.buffer, Event::Headers(message));
             stream.notify_recv();
+            // A head ending the stream ends the pushes promised on it.
+            stream.notify_push();
 
             // Only servers can receive a headers frame that initiates the stream.
             // This is verified in `Streams` before calling this function.
@@ -449,6 +451,7 @@ impl Recv {
             .pending_recv
             .push_back(&mut self.buffer, Event::Trailers(trailers, order));
         stream.notify_recv();
+        stream.notify_push();
 
         Ok(())
     }
@@ -752,6 +755,7 @@ impl Recv {
                 proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
+            stream.notify_push();
         }
 
         // Received a frame, but no one cared about it. fix issue#648
