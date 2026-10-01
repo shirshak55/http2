@@ -126,6 +126,11 @@ struct Inner {
     /// The streams opened for requests carrying their recorded stream id (see
     /// [`HeadersFrameOptions::recorded_stream_id`]), by that id, newest last
     recorded_streams: VecDeque<(u32, StreamId)>,
+
+    /// Whether requests open their streams on their recorded stream ids (see
+    /// [`HeadersFrameOptions::first_recorded_stream_id`]): decided by the first request,
+    /// and no longer once one can't
+    recorded_numbering: Option<bool>,
 }
 
 /// The PRIORITY_UPDATE frame type (RFC 9218).
@@ -334,7 +339,7 @@ where
         let send_buffer = &mut *send_buffer;
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        let next = me.actions.send.ensure_next_stream_id()?;
 
         // The `pending` argument is provided by the `Client`, and holds
         // a store `Key` of a `Stream` that may have been not been opened
@@ -353,7 +358,30 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
-        let stream_id = me.actions.send.open()?;
+        let recorded = headers_frame
+            .as_ref()
+            .and_then(|frame| frame.recorded_stream_id);
+        let first_recorded = headers_frame
+            .as_ref()
+            .and_then(|frame| frame.first_recorded_stream_id);
+        let numbered = *me
+            .recorded_numbering
+            .get_or_insert(recorded.is_some() && recorded == first_recorded);
+        let stream_id = match recorded.map(StreamId::from) {
+            // The streams in between go unused, as on the recorded connection.
+            Some(id)
+                if numbered
+                    && id >= next
+                    && id.is_server_initiated() == next.is_server_initiated() =>
+            {
+                me.actions.send.maybe_reset_next_stream_id(id);
+                id
+            }
+            _ => {
+                me.recorded_numbering = Some(false);
+                me.actions.send.open()?
+            }
+        };
 
         let mut stream = Stream::new(
             stream_id,
@@ -382,9 +410,6 @@ where
         }
 
         // Convert the message
-        let recorded = headers_frame
-            .as_ref()
-            .and_then(|frame| frame.recorded_stream_id);
         let renumber = |me: &Inner, priority: frame::Priority| match recorded {
             Some(recorded) => me.renumber_priority(priority, recorded, stream_id),
             None => priority,
@@ -1012,6 +1037,7 @@ impl Inner {
             frame_log: config.frame_log,
             received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
+            recorded_numbering: None,
         }))
     }
 

@@ -105,6 +105,11 @@ pub struct HeadersFrameOptions {
     /// the first request's recorded here name the same idle streams, and ids above the
     /// request's own lie as far above the stream opened here.
     pub recorded_stream_id: Option<u32>,
+    /// The id the first request's stream had on the connection the request was recorded
+    /// on: a connection whose first request is that one opens each request's stream on its
+    /// `recorded_stream_id`, as long as that id lies past the streams it opened, so its
+    /// streams are numbered as recorded.
+    pub first_recorded_stream_id: Option<u32>,
     /// PRIORITY frames to send right before the HEADERS frame, in order.
     pub leading: Vec<Priority>,
     /// Frames to send right after the HEADERS frame, in order, before any DATA.
