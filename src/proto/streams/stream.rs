@@ -121,6 +121,10 @@ pub(super) struct Stream {
 
     /// How the request's HEADERS frame was sent, when recording frames
     pub sent_headers: Option<HeadersFrame>,
+
+    /// How many of the frames queued right after its HEADERS (see
+    /// [`FollowingFrame`](crate::ext::FollowingFrame)) are still to go out, right after it
+    pub following: usize,
 }
 
 /// State related to validating a stream's content-length
@@ -203,6 +207,7 @@ impl Stream {
             refuse_pushes: false,
             content_length: ContentLength::Omitted,
             sent_headers: None,
+            following: 0,
         }
     }
 

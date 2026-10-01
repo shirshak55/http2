@@ -56,6 +56,10 @@ pub(super) struct Prioritize {
     /// The newest stream whose HEADERS went out.
     headers_sent: StreamId,
 
+    /// Whether the stream at the front of `pending_send` has frames following its HEADERS
+    /// still to go out (see `Stream::following`), which no stream opening goes ahead of.
+    sending_following: bool,
+
     /// What `DATA` frame is currently being sent in the codec.
     in_flight_data_frame: InFlightData,
 
@@ -105,6 +109,7 @@ impl Prioritize {
             flow,
             last_opened_id: StreamId::ZERO,
             headers_sent: StreamId::ZERO,
+            sending_following: false,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
         }
@@ -715,6 +720,7 @@ impl Prioritize {
             match self.pending_send.pop(store) {
                 Some(mut stream) => {
                     let _span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
+                    self.sending_following = false;
 
                     // It's possible that this stream, besides having data to send,
                     // is also queued to send a reset, and thus is already in the queue
@@ -858,6 +864,8 @@ impl Prioritize {
                         Some(frame) => {
                             if let Frame::Headers(_) = frame {
                                 self.headers_sent = self.headers_sent.max(stream.id);
+                            } else {
+                                stream.following = stream.following.saturating_sub(1);
                             }
                             frame.map(|_| {
                                 unreachable!(
@@ -894,7 +902,13 @@ impl Prioritize {
                         self.last_opened_id = stream.id;
                     }
 
-                    if !stream.pending_send.is_empty() || stream.state.is_scheduled_reset() {
+                    // The frames following its HEADERS go out right after it, ahead of any
+                    // other stream's.
+                    self.sending_following =
+                        stream.following > 0 && !stream.pending_send.is_empty();
+                    if self.sending_following {
+                        self.pending_send.push_front(&mut stream);
+                    } else if !stream.pending_send.is_empty() || stream.state.is_scheduled_reset() {
                         // TODO: Only requeue the sender IF it is ready to send
                         // the next frame. i.e. don't requeue it if the next
                         // frame is a data frame and the stream does not have
@@ -918,7 +932,7 @@ impl Prioritize {
     ) -> Option<store::Ptr<'s>> {
         tracing::trace!("schedule_pending_open");
         // check for any pending open streams
-        if counts.can_inc_num_send_streams() {
+        if !self.sending_following && counts.can_inc_num_send_streams() {
             if let Some(mut stream) = self.pending_open.pop(store) {
                 tracing::trace!("schedule_pending_open; stream={:?}", stream.id);
 

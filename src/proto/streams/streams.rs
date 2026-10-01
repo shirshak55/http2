@@ -598,6 +598,7 @@ where
             return Err(err.into());
         }
 
+        stream.following = following.len();
         me.actions
             .send
             .queue_frames(following, send_buffer, &mut stream, &mut me.actions.task);
