@@ -101,14 +101,16 @@ pub struct HeadersFrameOptions {
     /// The id the request's stream had on the connection `priority` was recorded on, whose
     /// stream ids its dependency and the PRIORITY frames of `leading` and `following` name:
     /// the recorded request's own id names the stream opened here, a request's recorded
-    /// earlier names the stream opened here for it (the root when none was), ids below
-    /// the first request's recorded here name the same idle streams, and ids above the
-    /// request's own lie as far above the stream opened here.
+    /// earlier names the stream opened here for it (when none was, a dependency on it is on
+    /// the root and a PRIORITY frame for it isn't sent), ids below the first request's
+    /// (`first_recorded_stream_id`, else the first recorded here) name the same idle
+    /// streams, and ids above the request's own lie as far above the stream opened here. A
+    /// dependency renumbered to the stream itself is on the root.
     pub recorded_stream_id: Option<u32>,
     /// The id the first request's stream had on the connection the request was recorded
-    /// on: a connection whose first request is that one opens each request's stream on its
-    /// `recorded_stream_id`, as long as that id lies past the streams it opened, so its
-    /// streams are numbered as recorded.
+    /// on, the ids below which name idle streams: a connection whose first request is that
+    /// one opens each request's stream on its `recorded_stream_id`, as long as that id lies
+    /// past the streams it opened, so its streams are numbered as recorded.
     pub first_recorded_stream_id: Option<u32>,
     /// PRIORITY frames to send right before the HEADERS frame, in order.
     pub leading: Vec<Priority>,

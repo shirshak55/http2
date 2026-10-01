@@ -131,6 +131,10 @@ struct Inner {
     /// [`HeadersFrameOptions::first_recorded_stream_id`]): decided by the first request,
     /// and no longer once one can't
     recorded_numbering: Option<bool>,
+
+    /// The stream of the first request on the connection the requests were recorded on
+    /// (see [`HeadersFrameOptions::first_recorded_stream_id`]), once a request carried it
+    first_recorded: Option<u32>,
 }
 
 /// The PRIORITY_UPDATE frame type (RFC 9218).
@@ -367,6 +371,7 @@ where
         let numbered = *me
             .recorded_numbering
             .get_or_insert(recorded.is_some() && recorded == first_recorded);
+        me.first_recorded = me.first_recorded.or(first_recorded);
         let stream_id = match recorded.map(StreamId::from) {
             // The streams in between go unused, as on the recorded connection.
             Some(id)
@@ -412,7 +417,7 @@ where
         // Convert the message
         let renumber = |me: &Inner, priority: frame::Priority| match recorded {
             Some(recorded) => me.renumber_priority(priority, recorded, stream_id),
-            None => priority,
+            None => Some(priority),
         };
         let (pseudo_order, stream_dependency, leading, following) = match headers_frame {
             Some(frame) => (
@@ -420,11 +425,11 @@ where
                     .pseudo_order
                     .or_else(|| me.headers_pseudo_order.clone()),
                 frame.priority.map(|priority| match recorded {
-                    Some(recorded) => priority.depending_on(me.renumber(
-                        priority.dependency_id().into(),
-                        recorded,
+                    Some(recorded) => renumbered_dependency(
+                        priority,
+                        me.renumber(priority.dependency_id().into(), recorded, stream_id),
                         stream_id,
-                    )),
+                    ),
                     None => priority,
                 }),
                 frame.leading,
@@ -449,9 +454,10 @@ where
                         increment,
                     ))
                 }
-                PrefaceFrame::Priority(priority) => {
-                    frame::Leading::Priority(renumber(&me, priority))
-                }
+                PrefaceFrame::Priority(priority) => match renumber(&me, priority) {
+                    Some(priority) => frame::Leading::Priority(priority),
+                    None => continue,
+                },
                 PrefaceFrame::Settings(params) => {
                     let mut settings = frame::Settings::default();
                     settings.set_wire(params);
@@ -476,25 +482,29 @@ where
         }
         let following: Vec<FollowingFrame> = following
             .into_iter()
-            .map(|frame| match frame {
-                FollowingFrame::Priority(priority) => {
-                    FollowingFrame::Priority(renumber(&me, priority))
-                }
-                FollowingFrame::Unknown {
-                    kind: PRIORITY_UPDATE,
-                    flags,
-                    on_stream: false,
-                    payload,
-                } => FollowingFrame::Unknown {
-                    kind: PRIORITY_UPDATE,
-                    flags,
-                    on_stream: false,
-                    payload: match recorded {
-                        Some(recorded) => me.renumber_priority_update(payload, recorded, stream_id),
-                        None => payload,
+            .filter_map(|frame| {
+                Some(match frame {
+                    FollowingFrame::Priority(priority) => {
+                        FollowingFrame::Priority(renumber(&me, priority)?)
+                    }
+                    FollowingFrame::Unknown {
+                        kind: PRIORITY_UPDATE,
+                        flags,
+                        on_stream: false,
+                        payload,
+                    } => FollowingFrame::Unknown {
+                        kind: PRIORITY_UPDATE,
+                        flags,
+                        on_stream: false,
+                        payload: match recorded {
+                            Some(recorded) => {
+                                me.renumber_priority_update(payload, recorded, stream_id)?
+                            }
+                            None => payload,
+                        },
                     },
-                },
-                frame => frame,
+                    frame => frame,
+                })
             })
             .collect();
         if let Some(recorded) = recorded {
@@ -515,7 +525,7 @@ where
         leading_frames.extend(
             leading
                 .into_iter()
-                .map(|priority| frame::Leading::Priority(renumber(&me, priority))),
+                .filter_map(|priority| renumber(&me, priority).map(frame::Leading::Priority)),
         );
         let mut headers = client::Peer::convert_send_message(
             stream_id,
@@ -832,6 +842,16 @@ impl Control {
     }
 }
 
+/// `dependency` depending on `id`, a stream renumbered for `stream`'s priority, instead: on
+/// the root when it's none, or `stream` itself.
+fn renumbered_dependency(
+    dependency: StreamDependency,
+    id: Option<StreamId>,
+    stream: StreamId,
+) -> StreamDependency {
+    dependency.depending_on(id.filter(|id| *id != stream).unwrap_or(StreamId::ZERO))
+}
+
 /// `frame` as a frame to send.
 fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
     match frame {
@@ -893,12 +913,13 @@ impl Inner {
             ControlFrame::Priority(priority) => {
                 let stream_id = self.recorded_stream(priority.stream_id().into())?;
                 let dependency = priority.dependency();
-                let dependency_id = self
-                    .recorded_stream(dependency.dependency_id().into())
-                    .unwrap_or(StreamId::ZERO);
                 frame::Leading::Priority(frame::Priority::new(
                     stream_id,
-                    dependency.depending_on(dependency_id),
+                    renumbered_dependency(
+                        dependency,
+                        self.recorded_stream(dependency.dependency_id().into()),
+                        stream_id,
+                    ),
                 ))
             }
             ControlFrame::PriorityUpdate(stream_id, field_value) => {
@@ -932,15 +953,16 @@ impl Inner {
 
     /// The stream this connection uses for `id`, a stream as the connection requests were
     /// recorded on numbered it: that of the request recorded as `id` (see
-    /// [`HeadersFrameOptions::recorded_stream_id`]); `id` itself below the first such
-    /// request's, a stream only PRIORITY frames name; and past the latest such request's, a
+    /// [`HeadersFrameOptions::recorded_stream_id`]); `id` itself below the first request's
+    /// (see [`Self::first_request`]), a stream only PRIORITY frames name; and past the
+    /// latest such request's, a
     /// stream no request opened yet, as far past the stream that request went out on, as
     /// requests sent in order open it. `None` for a stream of a request not sent here.
     fn recorded_stream(&self, id: u32) -> Option<StreamId> {
-        let Some((first, _)) = self.recorded_streams.front() else {
+        let Some(first) = self.first_request() else {
             return Some(StreamId::from(id));
         };
-        if id < *first {
+        if id < first {
             return Some(StreamId::from(id));
         }
         if let Some(opened) = self.opened_stream(id) {
@@ -957,63 +979,71 @@ impl Inner {
         })
     }
 
+    /// The stream of the first request, as the connection requests were recorded on
+    /// numbered it (see [`HeadersFrameOptions::first_recorded_stream_id`]), else of the
+    /// first recorded here: those below it are idle streams.
+    fn first_request(&self) -> Option<u32> {
+        self.first_recorded
+            .or_else(|| self.recorded_streams.front().map(|(id, _)| *id))
+    }
+
     /// The stream this connection uses for `id`, a stream as the connection a request was
     /// recorded on numbered it, where that request (`recorded`) is sent as `opened` (see
-    /// [`HeadersFrameOptions::recorded_stream_id`]).
-    fn renumber(&self, id: u32, recorded: u32, opened: StreamId) -> StreamId {
+    /// [`HeadersFrameOptions::recorded_stream_id`]); `None` for a stream of a request not
+    /// sent here.
+    fn renumber(&self, id: u32, recorded: u32, opened: StreamId) -> Option<StreamId> {
         if id == 0 {
-            return StreamId::ZERO;
+            return Some(StreamId::ZERO);
         }
         if id == recorded {
-            return opened;
+            return Some(opened);
         }
         if id > recorded {
-            return StreamId::from(
+            return Some(StreamId::from(
                 (id - recorded).saturating_add(opened.into()) & u32::from(StreamId::MAX),
-            );
+            ));
         }
-        let first = self
-            .recorded_streams
-            .front()
-            .map_or(recorded, |(id, _)| *id);
-        if id < first {
-            return StreamId::from(id);
+        if id < self.first_request().unwrap_or(recorded) {
+            return Some(StreamId::from(id));
         }
-        self.recorded_streams
-            .iter()
-            .rev()
-            .find(|(recorded, _)| *recorded == id)
-            .map_or(StreamId::ZERO, |(_, opened)| *opened)
+        self.opened_stream(id)
     }
 
     /// `payload`, a PRIORITY_UPDATE frame's, with its prioritized stream renumbered (see
-    /// [`Self::renumber`]).
-    fn renumber_priority_update(&self, payload: Bytes, recorded: u32, opened: StreamId) -> Bytes {
+    /// [`Self::renumber`]); `None` for a stream of a request not sent here.
+    fn renumber_priority_update(
+        &self,
+        payload: Bytes,
+        recorded: u32,
+        opened: StreamId,
+    ) -> Option<Bytes> {
         if payload.len() < 4 {
-            return payload;
+            return Some(payload);
         }
         let mut field_value = payload;
         let id = field_value.get_u32() & u32::from(StreamId::MAX);
-        let id = u32::from(self.renumber(id, recorded, opened));
-        [&id.to_be_bytes()[..], &field_value[..]].concat().into()
+        let id = u32::from(self.renumber(id, recorded, opened)?);
+        Some([&id.to_be_bytes()[..], &field_value[..]].concat().into())
     }
 
-    /// `priority` with its stream and dependency renumbered (see [`Self::renumber`]).
+    /// `priority` with its stream and dependency renumbered (see [`Self::renumber`]);
+    /// `None` for a stream of a request not sent here.
     fn renumber_priority(
         &self,
         priority: frame::Priority,
         recorded: u32,
         opened: StreamId,
-    ) -> frame::Priority {
+    ) -> Option<frame::Priority> {
+        let stream_id = self.renumber(priority.stream_id().into(), recorded, opened)?;
         let dependency = priority.dependency();
-        frame::Priority::new(
-            self.renumber(priority.stream_id().into(), recorded, opened),
-            dependency.depending_on(self.renumber(
-                dependency.dependency_id().into(),
-                recorded,
-                opened,
-            )),
-        )
+        Some(frame::Priority::new(
+            stream_id,
+            renumbered_dependency(
+                dependency,
+                self.renumber(dependency.dependency_id().into(), recorded, opened),
+                stream_id,
+            ),
+        ))
     }
 
     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
@@ -1038,6 +1068,7 @@ impl Inner {
             received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
             recorded_numbering: None,
+            first_recorded: None,
         }))
     }
 
