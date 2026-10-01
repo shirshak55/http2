@@ -310,7 +310,7 @@ where
                             // This will also handle flushing `self.codec`
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
-                            if (self.inner.error.is_some()
+                            if ((self.inner.error.is_some() && !self.inner.streams.leaves_close())
                                 || self.inner.go_away.should_close_on_idle())
                                 && !self.inner.streams.has_streams()
                             {
@@ -431,8 +431,9 @@ where
     }
 
     fn go_away_now(&mut self, e: Reason) {
-        // The caller's GOAWAY (see `Control::send_go_away`) was the connection's: it just closes.
-        if self.streams.went_away() {
+        // The caller's GOAWAY (see `Control::send_go_away`) was the connection's, or the caller
+        // closes it (see `Control::leave_close_to_caller`): it just closes.
+        if self.streams.closes_without_go_away() {
             if let State::Open = self.state {
                 *self.state = State::Closing(e, Initiator::Library);
             }

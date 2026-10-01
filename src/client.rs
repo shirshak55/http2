@@ -277,6 +277,22 @@ impl Control {
         self.inner.send_go_away(last_stream_id, reason, debug_data);
     }
 
+    /// Leaves closing the connection to its caller, as a client relaying another's end does:
+    /// it sends no GOAWAY of its own, only those [`Self::send_go_away`] sends, and stays open
+    /// past the peer's GOAWAY until the peer closes it or its handles are dropped.
+    pub fn leave_close_to_caller(&self) {
+        self.inner.leave_close_to_caller();
+    }
+
+    /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as the
+    /// connection requests were recorded on numbered it (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the
+    /// latest request sent here on it or below it was, else as sent; its error code; and its
+    /// debug data.
+    pub fn on_go_away(&self, go_away: impl Fn(u32, Reason, Bytes) + Send + Sync + 'static) {
+        self.inner.on_go_away(go_away);
+    }
+
     /// Resolves once the frames sent through this connection's handles went out on its
     /// transport, or the connection ended.
     pub async fn sent(&self) {

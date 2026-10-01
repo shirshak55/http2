@@ -121,6 +121,13 @@ struct Inner {
     /// its own then
     went_away: bool,
 
+    /// Whether closing is left to the connection's caller (see
+    /// [`Control::leave_close_to_caller`])
+    leaves_close: bool,
+
+    /// Called with each GOAWAY the peer sends (see [`Control::on_go_away`])
+    go_away_hook: Option<GoAwayHook>,
+
     /// Whether frames a [`Control`] queued were buffered since the codec was last flushed
     control_unflushed: bool,
 
@@ -692,9 +699,11 @@ impl<B> DynStreams<'_, B> {
         self.inner.lock().actions.recv.last_processed_id()
     }
 
-    /// Whether a GOAWAY a [`Control`] queued went out.
-    pub fn went_away(&self) -> bool {
-        self.inner.lock().went_away
+    /// Whether the connection's close sends no GOAWAY of its own: a GOAWAY a [`Control`]
+    /// queued went out, or closing is left to its caller.
+    pub fn closes_without_go_away(&self) -> bool {
+        let me = self.inner.lock();
+        me.went_away || me.leaves_close
     }
 
     pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), Error> {
@@ -745,6 +754,17 @@ pub(crate) struct Queued {
     /// right ahead of the HEADERS of a request recorded after it that is sent first.
     after: u32,
     frame: ControlFrame,
+}
+
+/// Called with the last stream, numbered as the connection requests were recorded on
+/// numbered it, the error code and the debug data of each GOAWAY the peer sends.
+#[derive(Clone)]
+struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes) + std::marker::Send + Sync>);
+
+impl fmt::Debug for GoAwayHook {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.pad("GoAwayHook(..)")
+    }
 }
 
 /// A frame queued by a [`Control`], its streams numbered as the connection requests were
@@ -822,6 +842,21 @@ impl Control {
             reason,
             Bytes::copy_from_slice(debug_data),
         ));
+    }
+
+    /// Leaves closing the connection to its caller: it sends no GOAWAY of its own, and stays
+    /// open past the peer's until the peer closes it or its handles are dropped.
+    pub(crate) fn leave_close_to_caller(&self) {
+        self.inner.lock().leaves_close = true;
+    }
+
+    /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
+    /// [`Inner::recorded_id`] does, its error code and its debug data.
+    pub(crate) fn on_go_away(
+        &self,
+        go_away: impl Fn(u32, Reason, Bytes) + std::marker::Send + Sync + 'static,
+    ) {
+        self.inner.lock().go_away_hook = Some(GoAwayHook(Arc::new(go_away)));
     }
 
     /// Resolves once the frames queued (see [`Queued`]) went out on the transport, or the
@@ -1009,6 +1044,22 @@ impl Inner {
             .map(|(_, opened)| *opened)
     }
 
+    /// `id`, a stream of this connection's, numbered as the connection requests were
+    /// recorded on numbered it: as the latest request sent here on it or below it was (see
+    /// [`HeadersFrameOptions::recorded_stream_id`]); `id` itself when none was, and for the
+    /// highest stream.
+    fn recorded_id(&self, id: StreamId) -> u32 {
+        if id == StreamId::MAX {
+            return id.into();
+        }
+        self.recorded_streams
+            .iter()
+            .filter(|(_, opened)| *opened <= id)
+            .map(|(recorded, _)| *recorded)
+            .max()
+            .unwrap_or(id.into())
+    }
+
     /// The stream this connection uses for `id`, a stream as the connection requests were
     /// recorded on numbered it: that of the request recorded as `id` (see
     /// [`HeadersFrameOptions::recorded_stream_id`]); `id` itself below the first request's
@@ -1123,6 +1174,8 @@ impl Inner {
             control: VecDeque::new(),
             released: VecDeque::new(),
             went_away: false,
+            leaves_close: false,
+            go_away_hook: None,
             control_unflushed: false,
             sent_tasks: Vec::new(),
             frame_log: config.frame_log,
@@ -1453,6 +1506,7 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         frame: &frame::GoAway,
     ) -> Result<(), Error> {
+        let recorded = self.recorded_id(frame.last_stream_id());
         let actions = &mut self.actions;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock();
@@ -1461,6 +1515,10 @@ impl Inner {
         let last_stream_id = frame.last_stream_id();
 
         actions.send.recv_go_away(last_stream_id)?;
+
+        if let Some(hook) = &self.go_away_hook {
+            (hook.0)(recorded, frame.reason(), frame.debug_data().clone());
+        }
 
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
 
@@ -1797,6 +1855,12 @@ where
     pub fn has_streams(&self) -> bool {
         let me = self.inner.lock();
         me.counts.has_streams()
+    }
+
+    /// Whether closing is left to the connection's caller (see
+    /// [`Control::leave_close_to_caller`]).
+    pub fn leaves_close(&self) -> bool {
+        self.inner.lock().leaves_close
     }
 
     pub fn has_streams_or_other_references(&self) -> bool {
