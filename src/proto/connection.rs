@@ -431,6 +431,13 @@ where
     }
 
     fn go_away_now(&mut self, e: Reason) {
+        // The caller's GOAWAY (see `Control::send_go_away`) was the connection's: it just closes.
+        if self.streams.went_away() {
+            if let State::Open = self.state {
+                *self.state = State::Closing(e, Initiator::Library);
+            }
+            return;
+        }
         let last_processed_id = self.streams.last_processed_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_now(frame);

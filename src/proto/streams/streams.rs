@@ -117,6 +117,16 @@ struct Inner {
     /// that won't be sent on this connection (see [`Control::release_request`]), newest last
     released: VecDeque<u32>,
 
+    /// Whether a GOAWAY a [`Control`] queued went out: the connection's close sends none of
+    /// its own then
+    went_away: bool,
+
+    /// Whether frames a [`Control`] queued were buffered since the codec was last flushed
+    control_unflushed: bool,
+
+    /// The tasks waiting for the frames a [`Control`] queued to go out (see [`Control::sent`])
+    sent_tasks: Vec<Waker>,
+
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
 
@@ -520,6 +530,7 @@ where
                 .count();
             for queued in me.control.drain(..ahead).collect::<Vec<_>>() {
                 leading_frames.extend(me.control_frame(queued.frame));
+                me.control_unflushed = true;
             }
         }
         leading_frames.extend(
@@ -681,6 +692,11 @@ impl<B> DynStreams<'_, B> {
         self.inner.lock().actions.recv.last_processed_id()
     }
 
+    /// Whether a GOAWAY a [`Control`] queued went out.
+    pub fn went_away(&self) -> bool {
+        self.inner.lock().went_away
+    }
+
     pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), Error> {
         let mut me = self.inner.lock();
         me.recv_window_update(self.send_buffer, frame)
@@ -742,6 +758,8 @@ pub(crate) enum ControlFrame {
     PriorityUpdate(u32, Bytes),
     /// A WINDOW_UPDATE frame's stream (0 for the connection) and increment.
     WindowUpdate(u32, WindowSize),
+    /// A GOAWAY frame's last stream id, error code and debug data.
+    GoAway(u32, Reason, Bytes),
 }
 
 impl fmt::Debug for Control {
@@ -793,6 +811,31 @@ impl Control {
     /// request not sent here.
     pub(crate) fn send_window_update(&self, stream_id: u32, increment: WindowSize) {
         self.queue(ControlFrame::WindowUpdate(stream_id, increment));
+    }
+
+    /// Queues a GOAWAY frame of `reason` and `debug_data` naming `last_stream_id`, a request's
+    /// renumbered as [`Inner::recorded_stream`] does when it goes out; the connection's close
+    /// then sends no GOAWAY of its own.
+    pub(crate) fn send_go_away(&self, last_stream_id: u32, reason: Reason, debug_data: &[u8]) {
+        self.queue(ControlFrame::GoAway(
+            last_stream_id,
+            reason,
+            Bytes::copy_from_slice(debug_data),
+        ));
+    }
+
+    /// Resolves once the frames queued (see [`Queued`]) went out on the transport, or the
+    /// connection ended.
+    pub(crate) async fn sent(&self) {
+        std::future::poll_fn(|cx| {
+            let mut me = self.inner.lock();
+            if (me.control.is_empty() && !me.control_unflushed) || me.actions.conn_error.is_some() {
+                return Poll::Ready(());
+            }
+            me.sent_tasks.push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
     }
 
     /// Queues `frames` to go out right ahead of the next request's HEADERS, after the
@@ -861,6 +904,7 @@ fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
         frame::Leading::Settings(frame) => frame.into(),
         frame::Leading::Ping(frame) => frame.into(),
         frame::Leading::Unknown(frame) => frame.into(),
+        frame::Leading::GoAway(frame) => frame.into(),
     }
 }
 
@@ -884,6 +928,7 @@ impl Inner {
             if let Some(frame) = self.control_frame(queued.frame) {
                 dst.buffer(leading_frame(frame))
                     .expect("invalid control frame");
+                self.control_unflushed = true;
             }
         }
         Poll::Ready(Ok(()))
@@ -938,6 +983,18 @@ impl Inner {
                     stream.recv_flow.inc_recv_window(increment).ok()?;
                 }
                 frame::Leading::WindowUpdate(frame::WindowUpdate::new(stream_id, increment))
+            }
+            ControlFrame::GoAway(last_stream_id, reason, debug_data) => {
+                self.went_away = true;
+                // A client-initiated stream is a request's.
+                let renumbered = Some(last_stream_id)
+                    .filter(|id| id % 2 == 1)
+                    .and_then(|id| self.recorded_stream(id));
+                frame::Leading::GoAway(frame::GoAway::with_debug_data(
+                    renumbered.unwrap_or(StreamId::from(last_stream_id)),
+                    reason,
+                    debug_data,
+                ))
             }
         })
     }
@@ -1065,6 +1122,9 @@ impl Inner {
             settings_acks: 0,
             control: VecDeque::new(),
             released: VecDeque::new(),
+            went_away: false,
+            control_unflushed: false,
+            sent_tasks: Vec::new(),
             frame_log: config.frame_log,
             received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
@@ -1550,6 +1610,10 @@ impl Inner {
 
         tracing::trace!("Streams::recv_eof");
 
+        for task in self.sent_tasks.drain(..) {
+            task.wake();
+        }
+
         self.store.for_each(|stream| {
             counts.transition(stream, |counts, stream| {
                 actions.recv.recv_eof(stream);
@@ -1600,6 +1664,15 @@ impl Inner {
 
         // Those following the HEADERS that just went out.
         ready!(self.poll_control(cx, dst))?;
+        if self.control_unflushed {
+            ready!(dst.flush(cx))?;
+            self.control_unflushed = false;
+        }
+        if self.control.is_empty() {
+            for task in self.sent_tasks.drain(..) {
+                task.wake();
+            }
+        }
 
         // Nothing else to do, track the task
         self.actions.task = Some(cx.waker().clone());

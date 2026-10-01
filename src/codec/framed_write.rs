@@ -380,6 +380,10 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                         payload: *f.payload(),
                     },
                     frame::Leading::Unknown(f) => unknown_frame(f),
+                    frame::Leading::GoAway(f) => LoggedFrame::GoAway {
+                        last_stream_id: f.last_stream_id().into(),
+                        error_code: f.reason().into(),
+                    },
                 });
             }
             LoggedFrame::Headers {

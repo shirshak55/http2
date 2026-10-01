@@ -270,6 +270,19 @@ impl Control {
         self.inner.release_request(recorded);
     }
 
+    /// Sends a GOAWAY frame of `reason` and `debug_data` naming `last_stream_id`, numbered
+    /// as [`Self::send_priority`]'s streams are when it is a client-initiated one; the
+    /// connection then closes without a GOAWAY of its own.
+    pub fn send_go_away(&self, last_stream_id: u32, reason: Reason, debug_data: &[u8]) {
+        self.inner.send_go_away(last_stream_id, reason, debug_data);
+    }
+
+    /// Resolves once the frames sent through this connection's handles went out on its
+    /// transport, or the connection ended.
+    pub async fn sent(&self) {
+        self.inner.sent().await;
+    }
+
     /// Makes the receive window of the request recorded as `recorded`, if sent here, and
     /// the connection's for the data it receives, grow only by the WINDOW_UPDATEs
     /// [`Self::send_window_update`] sends, those of a peer that data is relayed to, rather

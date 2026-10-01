@@ -1,4 +1,6 @@
-use super::{util, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate};
+use super::{
+    util, GoAway, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate,
+};
 use crate::ext::{HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
@@ -49,6 +51,7 @@ pub(crate) enum Leading {
     Settings(Settings),
     Ping(Ping),
     Unknown(Unknown),
+    GoAway(GoAway),
 }
 
 impl Leading {
@@ -59,6 +62,7 @@ impl Leading {
             Self::Settings(frame) => frame.encode(dst),
             Self::Ping(frame) => frame.encode(dst),
             Self::Unknown(frame) => frame.encode(dst),
+            Self::GoAway(frame) => frame.encode(dst),
         }
     }
 }
