@@ -116,6 +116,10 @@ pub(super) struct Stream {
     /// Whether the pushes promised on it are refused
     pub refuse_pushes: bool,
 
+    /// The reason it is reset with should its handles be dropped before it ends, CANCEL's
+    /// stead (see `Control::cancel_with`)
+    pub cancel_reason: Option<Reason>,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -205,6 +209,7 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             refuse_pushes: false,
+            cancel_reason: None,
             content_length: ContentLength::Omitted,
             sent_headers: None,
             following: 0,

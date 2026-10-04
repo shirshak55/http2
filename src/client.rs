@@ -136,7 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{FrameLog, HeaderOrder, PrefaceFrame, Protocol, ReceivedPreface};
+use crate::ext::{FrameLog, HeaderOrder, LoggedFrame, PrefaceFrame, Protocol, ReceivedPreface};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
@@ -222,6 +222,53 @@ impl Control {
     /// Sends a PING carrying `payload`. Its acknowledgement is ignored.
     pub fn send_ping(&self, payload: [u8; 8]) {
         self.inner.send_ping(payload);
+    }
+
+    /// Hands over the frames the peer sends past its connection preface (see
+    /// [`Self::received_preface`]) from now on, for a caller relaying them to another peer:
+    /// its SETTINGS, PINGs, WINDOW_UPDATEs and frames of types HTTP/2 doesn't define, as
+    /// [`LoggedFrame`]s in the order received, a request's stream numbered as it was
+    /// recorded (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)); a
+    /// WINDOW_UPDATE for a stream of no such request isn't handed over. The connection
+    /// then acknowledges neither those SETTINGS nor those PINGs itself:
+    /// [`Self::send_settings_ack`] and [`Self::send_ping_ack`] relay the other peer's
+    /// acknowledgements. Once the receiver is dropped, it acknowledges them itself again.
+    pub fn relay_received(&self) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
+        self.inner.relay_received(self.preface.clone())
+    }
+
+    /// Acknowledges the earliest relayed SETTINGS frame not yet acknowledged (see
+    /// [`Self::relay_received`]).
+    pub fn send_settings_ack(&self) {
+        self.inner.send_settings_ack();
+    }
+
+    /// Acknowledges a relayed PING carrying `payload` (see [`Self::relay_received`]).
+    pub fn send_ping_ack(&self, payload: [u8; 8]) {
+        self.inner.send_ping_ack(payload);
+    }
+
+    /// Sends a frame of a type HTTP/2 doesn't define, of `kind`, `flags` and `payload`, on
+    /// the connection (`stream_id` 0) or a stream numbered as [`Self::send_priority`]'s
+    /// streams are; not at all for a request this connection didn't send.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `payload` is longer than a frame can carry (2^24 - 1
+    /// octets).
+    pub fn send_unknown(&self, kind: u8, flags: u8, stream_id: u32, payload: &[u8]) {
+        assert!(payload.len() <= MAX_MAX_FRAME_SIZE as usize);
+        self.inner
+            .send_unknown(kind, flags, stream_id, Bytes::copy_from_slice(payload));
+    }
+
+    /// Makes the request recorded as `recorded` (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), if sent
+    /// here, reset with `reason` rather than CANCEL should it be dropped before it ends: as
+    /// the client it is relayed from reset it.
+    pub fn cancel_with(&self, recorded: u32, reason: Reason) {
+        self.inner.cancel_with(recorded, reason);
     }
 
     /// Sends `priority`, a PRIORITY frame numbered as the connection requests were recorded

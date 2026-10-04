@@ -409,6 +409,15 @@ impl Settings {
 
         let mut settings = Settings::default();
         debug_assert!(!settings.flags.is_ack());
+        let wire: Vec<_> = payload
+            .chunks_exact(6)
+            .map(|p| {
+                (
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u32::from_be_bytes([p[2], p[3], p[4], p[5]]),
+                )
+            })
+            .collect();
 
         for raw in payload.chunks(6) {
             if let Some(setting) = Setting::load(raw) {
@@ -467,6 +476,12 @@ impl Settings {
                     }
                 }
             }
+        }
+
+        // Kept as received when the fields don't reproduce it (unknown identifiers,
+        // repeats, another order), for a caller relaying it.
+        if settings.params() != wire {
+            settings.wire = Some(wire);
         }
 
         Ok(settings)

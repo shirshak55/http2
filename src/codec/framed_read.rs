@@ -413,19 +413,22 @@ fn decode_frame(
             }
         }
         Kind::Unknown => {
+            let payload = Bytes::copy_from_slice(&bytes[frame::HEADER_LEN..]);
             if frame_log.is_some() || preface.is_some() {
-                let payload = Bytes::copy_from_slice(&bytes[frame::HEADER_LEN..]);
                 let unknown = LoggedFrame::Unknown {
                     kind: bytes[3],
                     flags: head.flag(),
                     stream_id: head.stream_id().into(),
                     length: payload.len() as u32,
-                    payload,
+                    payload: payload.clone(),
                 };
                 record(frame_log, preface, Some(unknown));
             }
-            // Unknown frames are ignored
-            return Ok(None);
+            // Handed over for a caller relaying them (see `Control::relay_received`).
+            return Ok(Some(
+                frame::Unknown::new(bytes[3], head.flag(), head.stream_id().into(), payload)
+                    .into(),
+            ));
         }
     };
 

@@ -20,8 +20,8 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions,
-        NeverIndexedPseudo, PrefaceFrame, Protocol, RefusePushes,
+        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame,
+        NeverIndexedPseudo, PrefaceFrame, Protocol, ReceivedPreface, RefusePushes,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -152,6 +152,17 @@ struct Inner {
     /// The stream of the first request on the connection the requests were recorded on
     /// (see [`HeadersFrameOptions::first_recorded_stream_id`]), once a request carried it
     first_recorded: Option<u32>,
+
+    /// Where the frames the peer sends past its connection preface go, once relayed (see
+    /// [`Control::relay_received`])
+    relay: Option<Relay>,
+}
+
+/// Hands the peer's frames past its connection preface to a caller relaying them.
+#[derive(Debug)]
+struct Relay {
+    frames: tokio::sync::mpsc::UnboundedSender<LoggedFrame>,
+    preface: ReceivedPreface,
 }
 
 /// The PRIORITY_UPDATE frame type (RFC 9218).
@@ -717,6 +728,13 @@ impl<B> DynStreams<'_, B> {
         me.recv_window_update(self.send_buffer, frame)
     }
 
+    /// Hands `frame`, just received, to the caller relaying the frames past the peer's
+    /// connection preface (see [`Control::relay_received`]), if there is one and the
+    /// preface is complete; whether it did.
+    pub fn relay(&mut self, frame: LoggedFrame) -> bool {
+        self.inner.lock().relay(frame)
+    }
+
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
         let mut me = self.inner.lock();
         me.recv_push_promise(self.send_buffer, frame)
@@ -778,7 +796,13 @@ impl fmt::Debug for GoAwayHook {
 #[derive(Debug)]
 pub(crate) enum ControlFrame {
     Settings(frame::Settings),
+    /// The acknowledgement of a relayed SETTINGS frame (see [`Control::relay_received`]).
+    SettingsAck,
     Ping([u8; 8]),
+    /// The acknowledgement of a relayed PING carrying this payload.
+    Pong([u8; 8]),
+    /// A frame of a type HTTP/2 doesn't define: its type, flags, stream and payload.
+    Unknown(u8, u8, u32, Bytes),
     Priority(frame::Priority),
     /// A PRIORITY_UPDATE frame's prioritized stream and priority field value.
     PriorityUpdate(u32, Bytes),
@@ -813,6 +837,47 @@ impl Control {
     /// Queues a PING carrying `payload`.
     pub(crate) fn send_ping(&self, payload: [u8; 8]) {
         self.queue(ControlFrame::Ping(payload));
+    }
+
+    /// Queues the acknowledgement of the earliest relayed SETTINGS frame not yet
+    /// acknowledged (see [`Self::relay_received`]).
+    pub(crate) fn send_settings_ack(&self) {
+        self.queue(ControlFrame::SettingsAck);
+    }
+
+    /// Queues the acknowledgement of a relayed PING carrying `payload`.
+    pub(crate) fn send_ping_ack(&self, payload: [u8; 8]) {
+        self.queue(ControlFrame::Pong(payload));
+    }
+
+    /// Queues a frame of a type HTTP/2 doesn't define, its stream renumbered as
+    /// [`Inner::recorded_stream`] does when it goes out; none for a stream of a request not
+    /// sent here.
+    pub(crate) fn send_unknown(&self, kind: u8, flags: u8, stream_id: u32, payload: Bytes) {
+        self.queue(ControlFrame::Unknown(kind, flags, stream_id, payload));
+    }
+
+    /// Makes the request recorded as `recorded`, if sent here, reset with `reason` rather
+    /// than CANCEL should its handles be dropped before it ends.
+    pub(crate) fn cancel_with(&self, recorded: u32, reason: Reason) {
+        let mut me = self.inner.lock();
+        let Some(id) = me.opened_stream(recorded) else {
+            return;
+        };
+        if let Some(mut stream) = me.store.find_mut(&id) {
+            stream.cancel_reason = Some(reason);
+        }
+    }
+
+    /// Hands the frames the peer sends past its connection `preface` from now on to the
+    /// caller (see [`Inner::relay`]), which relays their acknowledgements.
+    pub(crate) fn relay_received(
+        &self,
+        preface: ReceivedPreface,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
+        let (frames, received) = tokio::sync::mpsc::unbounded_channel();
+        self.inner.lock().relay = Some(Relay { frames, preface });
+        received
     }
 
     /// Queues `priority`, renumbered as [`Inner::recorded_stream`] does when it goes out; a
@@ -996,7 +1061,16 @@ impl Inner {
     fn control_frame(&mut self, frame: ControlFrame) -> Option<frame::Leading> {
         Some(match frame {
             ControlFrame::Settings(frame) => frame::Leading::Settings(frame),
+            ControlFrame::SettingsAck => frame::Leading::Settings(frame::Settings::ack()),
             ControlFrame::Ping(payload) => frame::Leading::Ping(frame::Ping::new(payload)),
+            ControlFrame::Pong(payload) => frame::Leading::Ping(frame::Ping::pong(payload)),
+            ControlFrame::Unknown(kind, flags, stream_id, payload) => {
+                let stream_id = match stream_id {
+                    0 => 0,
+                    id => self.recorded_stream(id)?.into(),
+                };
+                frame::Leading::Unknown(frame::Unknown::new(kind, flags, stream_id, payload))
+            }
             ControlFrame::Priority(priority) => {
                 let stream_id = self.recorded_stream(priority.stream_id().into())?;
                 let dependency = priority.dependency();
@@ -1038,6 +1112,49 @@ impl Inner {
                 ))
             }
         })
+    }
+
+    /// Hands `frame`, just received, to the caller relaying the frames past the peer's
+    /// connection preface (see [`Control::relay_received`]), if there is one and the
+    /// preface is complete, a request's stream numbered as it was recorded (see
+    /// [`HeadersFrameOptions::recorded_stream_id`]); a WINDOW_UPDATE for a stream of no
+    /// such request goes to no one. Whether it did; a caller gone relays nothing more.
+    fn relay(&mut self, mut frame: LoggedFrame) -> bool {
+        let Some(relay) = &self.relay else {
+            return false;
+        };
+        if !relay.preface.is_complete() {
+            return false;
+        }
+        match &mut frame {
+            LoggedFrame::WindowUpdate { stream_id, .. } if *stream_id != 0 => {
+                match self.recorded_request(StreamId::from(*stream_id)) {
+                    Some(recorded) => *stream_id = recorded,
+                    None => return false,
+                }
+            }
+            LoggedFrame::Unknown { stream_id, .. } if *stream_id != 0 => {
+                if let Some(recorded) = self.recorded_request(StreamId::from(*stream_id)) {
+                    *stream_id = recorded;
+                }
+            }
+            _ => {}
+        }
+        if relay.frames.send(frame).is_err() {
+            self.relay = None;
+            return false;
+        }
+        true
+    }
+
+    /// The request, as recorded (see [`HeadersFrameOptions::recorded_stream_id`]), that went
+    /// out on `opened` here, if one did.
+    fn recorded_request(&self, opened: StreamId) -> Option<u32> {
+        self.recorded_streams
+            .iter()
+            .rev()
+            .find(|(_, id)| *id == opened)
+            .map(|(recorded, _)| *recorded)
     }
 
     /// The stream the request recorded as `recorded` (see
@@ -1189,6 +1306,7 @@ impl Inner {
             recorded_streams: VecDeque::new(),
             recorded_numbering: None,
             first_recorded: None,
+            relay: None,
         }))
     }
 
@@ -2419,14 +2537,16 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
         // Server is allowed to early respond without fully consuming the client input stream
         // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
         // Some other http2 implementation may interpret other error code as fatal if not respected (i.e: nginx https://trac.nginx.org/nginx/ticket/2376)
-        let reason = if counts.peer().is_server()
-            && stream.state.is_send_closed()
-            && stream.state.is_recv_streaming()
-        {
-            Reason::NO_ERROR
-        } else {
-            Reason::CANCEL
-        };
+        let reason = stream.cancel_reason.unwrap_or_else(|| {
+            if counts.peer().is_server()
+                && stream.state.is_send_closed()
+                && stream.state.is_recv_streaming()
+            {
+                Reason::NO_ERROR
+            } else {
+                Reason::CANCEL
+            }
+        });
 
         actions
             .send

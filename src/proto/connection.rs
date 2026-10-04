@@ -1,5 +1,5 @@
 use crate::codec::UserError;
-use crate::ext::{FrameLog, PrefaceFrame};
+use crate::ext::{FrameLog, LoggedFrame, PrefaceFrame};
 use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
 use crate::{client, server, tracing};
 
@@ -375,9 +375,10 @@ where
                 .as_dyn()
                 .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
             {
-                ReceivedFrame::Settings(frame) => {
+                ReceivedFrame::Settings(frame, relayed) => {
                     self.inner.settings.recv_settings(
                         frame,
+                        relayed,
                         &mut self.codec,
                         &mut self.inner.streams,
                     )?;
@@ -568,7 +569,13 @@ where
             }
             Some(Settings(frame)) => {
                 tracing::trace!(?frame, "recv SETTINGS");
-                return Ok(ReceivedFrame::Settings(frame));
+                // A relayed one's acknowledgement is the relayed peer's.
+                let relayed = !frame.is_ack()
+                    && self.streams.relay(LoggedFrame::Settings {
+                        ack: false,
+                        params: frame.params(),
+                    });
+                return Ok(ReceivedFrame::Settings(frame, relayed));
             }
             Some(GoAway(frame)) => {
                 tracing::trace!(?frame, "recv GOAWAY");
@@ -581,6 +588,15 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
+                // A relayed one's acknowledgement is the relayed peer's.
+                if !frame.is_ack()
+                    && self.streams.relay(LoggedFrame::Ping {
+                        ack: false,
+                        payload: *frame.payload(),
+                    })
+                {
+                    return Ok(ReceivedFrame::Continue);
+                }
                 let status = self.ping_pong.recv_ping(frame);
                 if status.is_shutdown() {
                     assert!(
@@ -594,15 +610,26 @@ where
             }
             Some(WindowUpdate(frame)) => {
                 tracing::trace!(?frame, "recv WINDOW_UPDATE");
+                let logged = LoggedFrame::WindowUpdate {
+                    stream_id: frame.stream_id().into(),
+                    increment: frame.size_increment(),
+                };
                 self.streams.recv_window_update(frame)?;
+                self.streams.relay(logged);
             }
             Some(Priority(_frame)) => {
                 tracing::trace!(?_frame, "recv PRIORITY");
                 // TODO: handle
             }
-            // The codec skips frames of unknown types.
-            Some(Unknown(_frame)) => {
-                tracing::trace!(?_frame, "recv unknown frame");
+            Some(Unknown(frame)) => {
+                tracing::trace!(?frame, "recv unknown frame");
+                self.streams.relay(LoggedFrame::Unknown {
+                    kind: frame.kind(),
+                    flags: frame.flags(),
+                    stream_id: frame.stream_id(),
+                    length: frame.payload().len() as u32,
+                    payload: frame.payload().clone(),
+                });
             }
             None => {
                 tracing::trace!("codec closed");
@@ -615,7 +642,8 @@ where
 }
 
 enum ReceivedFrame {
-    Settings(frame::Settings),
+    /// A SETTINGS frame, and whether it was relayed (see `Control::relay_received`).
+    Settings(frame::Settings, bool),
     Continue,
     Done,
 }

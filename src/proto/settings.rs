@@ -10,10 +10,11 @@ pub(crate) struct Settings {
     /// await their acknowledgements in the codec, which applies them in the order sent;
     /// several may await one at once (RFC 9113 §6.5.3).
     to_send: VecDeque<frame::Settings>,
-    /// Received SETTINGS frame pending processing. The ACK must be written to
-    /// the socket first then the settings applied **before** receiving any
+    /// Received SETTINGS frame pending processing, and whether it was relayed, which
+    /// leaves its ACK to the relayed peer (see `Control::relay_received`). The ACK must be
+    /// written to the socket first then the settings applied **before** receiving any
     /// further frames.
-    remote: Option<frame::Settings>,
+    remote: Option<(frame::Settings, bool)>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
     has_received_remote_initial_settings: bool,
@@ -33,6 +34,7 @@ impl Settings {
     pub(crate) fn recv_settings<T, B, C, P>(
         &mut self,
         frame: frame::Settings,
+        relayed: bool,
         codec: &mut Codec<T, B>,
         streams: &mut Streams<C, P>,
     ) -> Result<(), Error>
@@ -73,7 +75,7 @@ impl Settings {
             // We always ACK before reading more frames, so `remote` should
             // always be none!
             assert!(self.remote.is_none());
-            self.remote = Some(frame);
+            self.remote = Some((frame, relayed));
             Ok(())
         }
     }
@@ -107,8 +109,8 @@ impl Settings {
         C: Buf,
         P: Peer,
     {
-        if let Some(settings) = self.remote.clone() {
-            if !streams.defer_settings_ack() {
+        if let Some((settings, relayed)) = self.remote.clone() {
+            if !relayed && !streams.defer_settings_ack() {
                 if !dst.poll_ready(cx)?.is_ready() {
                     return Poll::Pending;
                 }

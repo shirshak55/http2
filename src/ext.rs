@@ -257,6 +257,11 @@ impl ReceivedPreface {
         PrefaceRecorder(self.clone())
     }
 
+    /// Whether the connection received all of it.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.lock().complete
+    }
+
     fn complete(&self) {
         let mut inner = self.lock();
         inner.complete = true;
