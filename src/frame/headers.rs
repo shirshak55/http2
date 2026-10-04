@@ -1232,13 +1232,13 @@ impl HeaderBlock {
         let res = decoder.decode(&mut cursor, |header, representation| {
             use crate::hpack::Header::*;
 
-            if !self.is_over_size {
-                self.received.fields.push(EncodedField {
-                    name: Bytes::copy_from_slice(header.name().as_slice()),
-                    value: Bytes::copy_from_slice(header.value_slice()),
-                    representation,
-                });
-            }
+            // Recorded once known well-formed and within the list size, which charges it,
+            // so that a malformed block's fields, which it doesn't, take no memory.
+            let recorded = (!self.is_over_size && !malformed).then(|| EncodedField {
+                name: Bytes::copy_from_slice(header.name().as_slice()),
+                value: Bytes::copy_from_slice(header.value_slice()),
+                representation,
+            });
 
             match header {
                 Field { name, value } => {
@@ -1286,6 +1286,10 @@ impl HeaderBlock {
                 Path(v) => set_pseudo!(path, v),
                 Protocol(v) => set_pseudo!(protocol, v),
                 Status(v) => set_pseudo!(status, v),
+            }
+
+            if let Some(field) = recorded.filter(|_| !malformed && !self.is_over_size) {
+                self.received.fields.push(field);
             }
 
             ControlFlow::Continue(())
