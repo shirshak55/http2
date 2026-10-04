@@ -31,13 +31,15 @@ impl Settings {
         }
     }
 
+    /// Handles a received SETTINGS frame; whether it acknowledged one the connection didn't
+    /// send of its own accord (see `frame::Settings::set_own`).
     pub(crate) fn recv_settings<T, B, C, P>(
         &mut self,
         frame: frame::Settings,
         relayed: bool,
         codec: &mut Codec<T, B>,
         streams: &mut Streams<C, P>,
-    ) -> Result<(), Error>
+    ) -> Result<bool, Error>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
@@ -62,7 +64,7 @@ impl Settings {
                     }
 
                     streams.apply_local_settings(&local)?;
-                    Ok(())
+                    Ok(!local.is_own())
                 }
                 None => {
                     // We haven't sent any SETTINGS frames to be ACKed, so
@@ -76,14 +78,15 @@ impl Settings {
             // always be none!
             assert!(self.remote.is_none());
             self.remote = Some((frame, relayed));
-            Ok(())
+            Ok(false)
         }
     }
 
     /// Queues a SETTINGS frame to send, whatever SETTINGS sent before await their
     /// acknowledgement.
-    pub(crate) fn send_settings(&mut self, frame: frame::Settings) {
+    pub(crate) fn send_settings(&mut self, mut frame: frame::Settings) {
         assert!(!frame.is_ack());
+        frame.set_own();
         tracing::trace!("queue to send local settings: {:?}", frame);
         self.to_send.push_back(frame);
     }

@@ -219,7 +219,8 @@ impl Control {
         self.inner.send_settings(frame);
     }
 
-    /// Sends a PING carrying `payload`. Its acknowledgement is ignored.
+    /// Sends a PING carrying `payload`, whose acknowledgement goes to the caller relaying the
+    /// frames past the peer's preface (see [`Self::relay_received`]), if any.
     pub fn send_ping(&self, payload: [u8; 8]) {
         self.inner.send_ping(payload);
     }
@@ -234,6 +235,9 @@ impl Control {
     /// then acknowledges neither those SETTINGS nor those PINGs itself:
     /// [`Self::send_settings_ack`] and [`Self::send_ping_ack`] relay the other peer's
     /// acknowledgements. Once the receiver is dropped, it acknowledges them itself again.
+    /// The peer's acknowledgements of the SETTINGS and PINGs sent for the other peer
+    /// ([`Self::send_settings`], [`Self::send_ping`], and those of the preface replayed)
+    /// come too, in their place among those frames.
     pub fn relay_received(&self) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
         self.inner.relay_received(self.preface.clone())
     }

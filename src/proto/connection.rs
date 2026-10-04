@@ -376,12 +376,18 @@ where
                 .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
             {
                 ReceivedFrame::Settings(frame, relayed) => {
-                    self.inner.settings.recv_settings(
+                    // The acknowledgement of a relayed one is the relaying caller's.
+                    if self.inner.settings.recv_settings(
                         frame,
                         relayed,
                         &mut self.codec,
                         &mut self.inner.streams,
-                    )?;
+                    )? {
+                        self.inner.streams.as_dyn().relay(LoggedFrame::Settings {
+                            ack: true,
+                            params: Vec::new(),
+                        });
+                    }
                 }
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
@@ -595,6 +601,10 @@ where
                         payload: *frame.payload(),
                     })
                 {
+                    return Ok(ReceivedFrame::Continue);
+                }
+                // So is the acknowledgement of a relayed one.
+                if frame.is_ack() && self.streams.relay_ping_ack(*frame.payload()) {
                     return Ok(ReceivedFrame::Continue);
                 }
                 let status = self.ping_pong.recv_ping(frame);

@@ -723,7 +723,11 @@ impl PushPromise {
                 field_size: 0,
                 is_over_size: false,
                 encoding: None,
-                received: HeaderBlockEncoding::default(),
+                received: HeaderBlockEncoding {
+                    padding: flags.is_padded().then_some(pad as u8),
+                    fragments: vec![src.len()],
+                    ..HeaderBlockEncoding::default()
+                },
                 pseudo: Pseudo::default(),
             },
             promised_id,
@@ -759,6 +763,21 @@ impl PushPromise {
 
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
+    }
+
+    /// Takes the decoded header fields' names in block order.
+    pub(crate) fn take_header_order(&mut self) -> HeaderOrder {
+        std::mem::take(&mut self.header_block.order)
+    }
+
+    /// Notes a CONTINUATION frame's fragment of `len` octets of the block.
+    pub(crate) fn push_fragment(&mut self, len: usize) {
+        self.header_block.received.fragments.push(len);
+    }
+
+    /// Takes how the block went on the wire, as decoded.
+    pub(crate) fn take_received_encoding(&mut self) -> HeaderBlockEncoding {
+        std::mem::take(&mut self.header_block.received)
     }
 
     pub fn encode(

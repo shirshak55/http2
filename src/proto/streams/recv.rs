@@ -253,12 +253,9 @@ impl Recv {
 
         let stream_id = frame.stream_id();
         let order = frame.take_header_order();
-        if stream.sent_headers.is_some() && !frame.pseudo().is_informational() {
-            stream.received = Some((
-                frame.take_received_encoding(),
-                crate::ext::BodyFrames::default(),
-            ));
-        }
+        let encoding = stream
+            .records_received
+            .then(|| frame.take_received_encoding());
         let (pseudo, fields) = frame.into_parts();
 
         if pseudo.protocol.is_some()
@@ -275,6 +272,9 @@ impl Recv {
         }
 
         if !pseudo.is_informational() {
+            if let Some(encoding) = encoding {
+                stream.received = Some((encoding, crate::ext::BodyFrames::default()));
+            }
             let message = counts
                 .peer()
                 .convert_poll_message(pseudo, fields, order, stream_id)?;
@@ -297,9 +297,13 @@ impl Recv {
         } else {
             // This is an informational response (1xx status code)
             // Convert to response and store it for polling
-            let message = counts
+            let mut message = counts
                 .peer()
                 .convert_poll_message(pseudo, fields, order, stream_id)?;
+            if let (peer::PollMessage::Client(response), Some(encoding)) = (&mut message, encoding)
+            {
+                response.extensions_mut().insert(encoding);
+            }
 
             tracing::trace!("Received informational response: stream_id={:?}", stream_id);
 
@@ -853,7 +857,7 @@ impl Recv {
 
     pub fn recv_push_promise(
         &mut self,
-        frame: frame::PushPromise,
+        mut frame: frame::PushPromise,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
         stream.state.reserve_remote()?;
@@ -881,8 +885,15 @@ impl Recv {
         }
 
         let promised_id = frame.promised_id();
+        let recorded = stream
+            .records_received
+            .then(|| (frame.take_received_encoding(), frame.take_header_order()));
         let (pseudo, fields) = frame.into_parts();
-        let req = crate::server::Peer::convert_poll_message(pseudo, fields, promised_id)?;
+        let mut req = crate::server::Peer::convert_poll_message(pseudo, fields, promised_id)?;
+        if let Some((encoding, order)) = recorded {
+            req.extensions_mut().insert(encoding);
+            req.extensions_mut().insert(order);
+        }
 
         if let Err(e) = frame::PushPromise::validate_request(&req) {
             use PushPromiseHeaderError::*;

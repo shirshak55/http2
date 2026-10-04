@@ -140,6 +140,10 @@ pub(super) struct Stream {
     /// How the response's header block and body went, when recording frames
     pub received: Option<(HeaderBlockEncoding, BodyFrames)>,
 
+    /// Whether to record how its response's header blocks and body went (see
+    /// [`Self::received`]), and a pushed request's header block
+    pub records_received: bool,
+
     /// How many of the frames queued right after its HEADERS (see
     /// [`FollowingFrame`](crate::ext::FollowingFrame)) are still to go out, right after it
     pub following: usize,
@@ -230,6 +234,7 @@ impl Stream {
             content_length: ContentLength::Omitted,
             sent_headers: None,
             received: None,
+            records_received: false,
             following: 0,
         }
     }

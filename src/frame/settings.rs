@@ -238,6 +238,8 @@ pub struct Settings {
     settings_order: SettingsOrder,
     /// The exact parameters to encode, when set by `set_wire`.
     wire: Option<Vec<(u16, u32)>>,
+    /// Whether the connection sends it of its own accord (see `Settings::set_own`).
+    own: bool,
 }
 
 /// A struct representing a single HTTP/2 setting that can be sent in a SETTINGS
@@ -283,6 +285,17 @@ impl Settings {
 
     pub fn is_ack(&self) -> bool {
         self.flags.is_ack()
+    }
+
+    /// Marks it sent of the connection's own accord, rather than for a peer a caller
+    /// relays (see `Control::relay_received`), so its acknowledgement goes to no one.
+    pub(crate) fn set_own(&mut self) {
+        self.own = true;
+    }
+
+    /// Whether the connection sends it of its own accord (see [`Self::set_own`]).
+    pub(crate) fn is_own(&self) -> bool {
+        self.own
     }
 
     pub fn initial_window_size(&self) -> Option<u32> {

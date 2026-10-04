@@ -157,6 +157,10 @@ struct Inner {
     /// Where the frames the peer sends past its connection preface go, once relayed (see
     /// [`Control::relay_received`])
     relay: Option<Relay>,
+
+    /// The payloads of the PINGs sent for a relaying caller (a [`Control`]'s, or a
+    /// request's preface frames') awaiting the peer's acknowledgements, oldest first
+    relayed_pings: VecDeque<[u8; 8]>,
 }
 
 /// Hands the peer's frames past its connection preface to a caller relaying them.
@@ -168,6 +172,10 @@ struct Relay {
 
 /// The PRIORITY_UPDATE frame type (RFC 9218).
 const PRIORITY_UPDATE: u8 = 0x10;
+
+/// How many PINGs sent for a relaying caller await acknowledgements at most: the oldest
+/// past them is taken for unanswered.
+const RELAYED_PINGS: usize = 1024;
 
 /// How many of the streams opened for requests carrying their recorded stream id are
 /// kept, to renumber the dependencies of the requests after them: those still open are
@@ -496,7 +504,10 @@ where
                     settings.set_wire(params);
                     frame::Leading::Settings(settings)
                 }
-                PrefaceFrame::Ping(payload) => frame::Leading::Ping(frame::Ping::new(payload)),
+                PrefaceFrame::Ping(payload) => {
+                    me.sent_relayed_ping(payload);
+                    frame::Leading::Ping(frame::Ping::new(payload))
+                }
                 PrefaceFrame::Unknown(f) => {
                     if f.payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
                         return Err(UserError::PayloadTooBig.into());
@@ -616,6 +627,7 @@ where
                 connection: log.clone(),
                 received: me.received_frame_log.clone().unwrap_or_else(|| log.clone()),
             });
+            stream.records_received = true;
         }
 
         let mut stream = me.store.insert(stream.id, stream);
@@ -740,6 +752,18 @@ impl<B> DynStreams<'_, B> {
     /// preface is complete; whether it did.
     pub fn relay(&mut self, frame: LoggedFrame) -> bool {
         self.inner.lock().relay(frame)
+    }
+
+    /// Hands the peer's acknowledgement of a PING carrying `payload` sent for a relaying
+    /// caller (see [`Control::relay_received`]) to that caller; whether it was one.
+    pub fn relay_ping_ack(&mut self, payload: [u8; 8]) -> bool {
+        let mut me = self.inner.lock();
+        let Some(at) = me.relayed_pings.iter().position(|sent| *sent == payload) else {
+            return false;
+        };
+        me.relayed_pings.remove(at);
+        me.relay(LoggedFrame::Ping { ack: true, payload });
+        true
     }
 
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
@@ -1069,7 +1093,10 @@ impl Inner {
         Some(match frame {
             ControlFrame::Settings(frame) => frame::Leading::Settings(frame),
             ControlFrame::SettingsAck => frame::Leading::Settings(frame::Settings::ack()),
-            ControlFrame::Ping(payload) => frame::Leading::Ping(frame::Ping::new(payload)),
+            ControlFrame::Ping(payload) => {
+                self.sent_relayed_ping(payload);
+                frame::Leading::Ping(frame::Ping::new(payload))
+            }
             ControlFrame::Pong(payload) => frame::Leading::Ping(frame::Ping::pong(payload)),
             ControlFrame::Unknown(kind, flags, stream_id, payload) => {
                 let stream_id = match stream_id {
@@ -1152,6 +1179,15 @@ impl Inner {
             return false;
         }
         true
+    }
+
+    /// Notes a PING carrying `payload` sent for a relaying caller, awaiting its
+    /// acknowledgement.
+    fn sent_relayed_ping(&mut self, payload: [u8; 8]) {
+        if self.relayed_pings.len() == RELAYED_PINGS {
+            self.relayed_pings.pop_front();
+        }
+        self.relayed_pings.push_back(payload);
     }
 
     /// The request, as recorded (see [`HeadersFrameOptions::recorded_stream_id`]), that went
@@ -1314,6 +1350,7 @@ impl Inner {
             recorded_numbering: None,
             first_recorded: None,
             relay: None,
+            relayed_pings: VecDeque::new(),
         }))
     }
 
@@ -1731,13 +1768,14 @@ impl Inner {
         // this requires a bit of indirection to make the borrow checker happy.
         let child_key: Option<store::Key> = {
             // Create state for the stream
-            let stream = self.store.insert(promised_id, {
+            let mut stream = self.store.insert(promised_id, {
                 Stream::new(
                     promised_id,
                     self.actions.send.init_window_sz(),
                     self.actions.recv.init_window_sz(),
                 )
             });
+            stream.records_received = self.frame_log.is_some();
 
             let actions = &mut self.actions;
 
