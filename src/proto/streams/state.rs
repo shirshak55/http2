@@ -351,6 +351,13 @@ impl State {
         }
     }
 
+    pub fn get_user_reset(&self) -> Option<Reason> {
+        match self.inner {
+            Closed(Cause::Error(Error::Reset(_, reason, Initiator::User))) => Some(reason),
+            _ => None,
+        }
+    }
+
     pub fn is_scheduled_reset(&self) -> bool {
         matches!(self.inner, Closed(Cause::ScheduledLibraryReset(..)))
     }

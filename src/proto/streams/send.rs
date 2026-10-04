@@ -320,7 +320,11 @@ impl Send {
         let headers_queued = stream.is_pending_open
             || (counts.peer().is_local_init(stream.id)
                 && stream.id > self.prioritize.headers_sent());
-        if !headers_queued {
+        // A reset relayed from the request's client (see `Control::cancel_with`) goes after
+        // the DATA queued before it as far as that goes at once (all of it for NO_ERROR),
+        // the client having sent it first; the rest is dropped (see `Prioritize::pop_frame`).
+        let flushes = initiator == Initiator::User && stream.cancel_reason == Some(reason);
+        if !headers_queued && !flushes {
             // Otherwise, drop any buffered DATA/HEADERS and only send the
             // reset.
             //
@@ -335,7 +339,11 @@ impl Send {
         tracing::trace!("send_reset -- queueing; frame={:?}", frame);
         self.prioritize
             .queue_frame(frame.into(), buffer, stream, task);
-        self.prioritize.reclaim_all_capacity(stream, counts);
+        if flushes {
+            self.prioritize.reserve_capacity(0, stream, counts);
+        } else {
+            self.prioritize.reclaim_all_capacity(stream, counts);
+        }
     }
 
     pub fn schedule_implicit_reset(

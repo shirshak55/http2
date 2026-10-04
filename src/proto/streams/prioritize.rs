@@ -738,8 +738,9 @@ impl Prioritize {
             }
 
             // Its planned frames go whatever the window: an empty one takes none of it, and
-            // padding it lacks room for is dropped.
-            let planned = !frame.plan_mut().is_empty();
+            // padding it lacks room for is dropped. A stream reset since sends the rest only
+            // as far as it goes at once.
+            let planned = !frame.plan_mut().is_empty() || Self::flushes_before_reset(&stream);
             self.push_back_frame(frame.into(), buffer, &mut stream);
             if planned {
                 self.pending_send.push(&mut stream);
@@ -786,6 +787,37 @@ impl Prioritize {
                 stream.sending_planned = false;
             }
         }
+    }
+
+    /// Drops the frames `stream` queued ahead of its RST_STREAM, which can't go at once
+    /// (see [`Self::flushes_before_reset`]).
+    fn drop_until_reset<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        while let Some(frame) = stream.pending_send.pop_front(buffer) {
+            if let Frame::Reset(_) = frame {
+                stream.pending_send.push_front(buffer, frame);
+                break;
+            }
+            tracing::trace!(?frame, "dropping");
+        }
+        stream.buffered_send_data = 0;
+        stream.requested_send_capacity = 0;
+        stream.sending_planned = false;
+        self.reclaim_all_capacity(stream, counts);
+        self.pending_send.push(stream);
+    }
+
+    /// Whether `stream`'s client reset it, relayed, with frames still queued, which go
+    /// ahead of its RST_STREAM as far as they can at once (see `Send::send_reset`).
+    fn flushes_before_reset(stream: &Stream) -> bool {
+        matches!(
+            stream.state.get_user_reset(),
+            Some(reason) if reason != Reason::NO_ERROR && stream.cancel_reason == Some(reason)
+        )
     }
 
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
@@ -854,6 +886,7 @@ impl Prioritize {
                             // Get the amount of capacity remaining for stream's
                             // window.
                             let stream_capacity = stream.send_flow.available();
+                            let flushing = Self::flushes_before_reset(&stream);
 
                             // The frame it goes as next, when laid out (see
                             // `Data::plan_mut`): an empty one carries none of it.
@@ -905,7 +938,11 @@ impl Prioritize {
                                 // happen if the remote reduced the stream
                                 // window. In this case, we need to buffer the
                                 // frame and wait for a window update...
-                                stream.pending_send.push_front(buffer, frame.into());
+                                if flushing {
+                                    self.drop_until_reset(buffer, &mut stream, counts);
+                                } else {
+                                    stream.pending_send.push_front(buffer, frame.into());
+                                }
 
                                 continue;
                             }
@@ -928,7 +965,11 @@ impl Prioritize {
                             // scenarios, maybe the window we know is available but the window which
                             // peer knows is not.
                             if flow_len > 0 && flow_len > stream.send_flow.window_size() {
-                                stream.pending_send.push_front(buffer, frame.into());
+                                if flushing {
+                                    self.drop_until_reset(buffer, &mut stream, counts);
+                                } else {
+                                    stream.pending_send.push_front(buffer, frame.into());
+                                }
                                 continue;
                             }
 

@@ -26,6 +26,9 @@ pub(super) struct Recv {
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
 
+    /// The task waiting for room among the data received (see [`Recv::poll_buffered_room`]).
+    buffered_task: Option<Waker>,
+
     /// The lowest stream ID that is still idle
     next_stream_id: Result<StreamId, StreamIdOverflow>,
 
@@ -80,6 +83,11 @@ pub(super) enum RecvHeaderBlockError<T> {
     State(Error),
 }
 
+/// How many octets of the data received a connection holds unreleased before it reads no
+/// more frames (see [`Recv::poll_buffered_room`]): relayed windows can be far larger, and a
+/// caller passing the data on to a peer slower to take it would otherwise hold all of it.
+const BUFFERED_DATA: WindowSize = 16 << 20;
+
 #[derive(Debug)]
 pub(crate) enum Open {
     PushPromise,
@@ -104,6 +112,7 @@ impl Recv {
             flow,
             stream_threshold: config.stream_window_threshold,
             in_flight_data: 0 as WindowSize,
+            buffered_task: None,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
             last_processed_id: StreamId::ZERO,
@@ -476,6 +485,26 @@ impl Recv {
         Ok(())
     }
 
+    /// Ready once the data received and not yet released is less than [`BUFFERED_DATA`].
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        if self.in_flight_data < BUFFERED_DATA {
+            return Poll::Ready(());
+        }
+        self.buffered_task = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Counts `capacity` of the data received as released, waking the task waiting for room
+    /// among it.
+    fn release_in_flight(&mut self, capacity: WindowSize) {
+        self.in_flight_data -= capacity;
+        if self.in_flight_data < BUFFERED_DATA {
+            if let Some(task) = self.buffered_task.take() {
+                task.wake();
+            }
+        }
+    }
+
     /// Releases capacity of the connection
     pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
         tracing::trace!(
@@ -485,7 +514,7 @@ impl Recv {
         );
 
         // Decrement in-flight data
-        self.in_flight_data -= capacity;
+        self.release_in_flight(capacity);
 
         // Assign capacity to connection
         // TODO: proper error handling
@@ -514,7 +543,7 @@ impl Recv {
 
         if stream.recv_flow.is_mirror() {
             // The peer's WINDOW_UPDATEs the data is relayed to grow the windows instead.
-            self.in_flight_data -= capacity;
+            self.release_in_flight(capacity);
             stream.in_flight_recv_data -= capacity;
             return Ok(());
         }

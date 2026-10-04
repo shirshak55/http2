@@ -243,7 +243,8 @@ impl Control {
     }
 
     /// Hands over the frames the peer sends past its connection preface (see
-    /// [`Self::received_preface`]) from now on, for a caller relaying them to another peer:
+    /// [`Self::received_preface`], which ends as soon as it holds a SETTINGS frame from
+    /// now on) from now on, for a caller relaying them to another peer:
     /// its SETTINGS, PINGs, WINDOW_UPDATEs and frames of types HTTP/2 doesn't define, as
     /// [`LoggedFrame`]s in the order received, a request's stream numbered as it was
     /// recorded (see
@@ -267,10 +268,12 @@ impl Control {
         RelayedFrames(self.inner.relay_received(self.preface.clone()))
     }
 
-    /// Whether the frames sent through its handles lag behind, awaiting their turn: 4,096
-    /// of them, or 1 MiB of their payloads.
-    pub fn backlogged(&self) -> bool {
-        self.inner.backlogged()
+    /// Ready once the frames sent through its handles leave room for more, fewer than
+    /// 4,096 of them, and 1 MiB of their payloads, awaiting their turn, or the connection
+    /// ended: a caller sending its own peer's frames on as they arrive reads no more of
+    /// them until then.
+    pub fn poll_room(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner.poll_room(cx)
     }
 
     /// Whether the request recorded as `recorded` (see
@@ -311,7 +314,8 @@ impl Control {
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), if sent
     /// here, reset with `reason` should it be dropped before it ends (rather than CANCEL) or
     /// reset (as [`SendStream::send_reset`] does, rather than its reason): as the client it
-    /// is relayed from reset it.
+    /// is relayed from reset it: at once if it went out whole. A request sent here later is
+    /// reset so too, at once after its HEADERS when those end it.
     pub fn cancel_with(&self, recorded: u32, reason: Reason) {
         self.inner.cancel_with(recorded, reason);
     }
@@ -401,9 +405,9 @@ impl Control {
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the
     /// latest request sent here on it or below it was, else as sent; its error code; its
     /// debug data; the open requests sent here past it, which it leaves unprocessed; and
-    /// the requests sent here whose response frames (heads, data, trailers) received
-    /// before it the caller didn't take yet, which a client of the peer would get ahead of
-    /// it; requests as recorded.
+    /// the requests sent here it answered before it, whose response heads or resets were
+    /// received, or response frames the caller didn't take yet, which a client of the peer
+    /// would get ahead of it, whether or not the caller took them; requests as recorded.
     pub fn on_go_away(
         &self,
         go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + Send + Sync + 'static,

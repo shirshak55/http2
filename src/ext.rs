@@ -432,7 +432,11 @@ impl FrameLog {
 /// [`LoggedFrame`]s in wire order, once the connection received all of it: the peer's
 /// SETTINGS ACK or a frame of any other kind ends it (and isn't part of it), as does one
 /// past 1,024 frames or 1 MiB of their payloads, or the connection's end (then it holds
-/// what arrived: nothing when the peer sent no SETTINGS).
+/// what arrived: nothing when the peer sent no SETTINGS). Once a caller relays the frames
+/// past it (see [`Control::relay_received`](crate::client::Control::relay_received)), it
+/// ends as soon as it holds a SETTINGS frame, the frames after going to that caller: a
+/// peer acknowledging the connection's SETTINGS only once it got what the relayed peer
+/// may send it only past the preface isn't waited for.
 ///
 /// Resolves as soon as it is complete, ahead of any response; see
 /// [`Control::received_preface`](crate::client::Control::received_preface).
@@ -445,6 +449,10 @@ struct ReceivedPrefaceInner {
     /// The octets of their payloads.
     octets: usize,
     complete: bool,
+    /// Whether a caller relays the frames past it, which ends it once it holds a SETTINGS.
+    relayed: bool,
+    /// Whether it took the latest frame the connection received.
+    took_latest: bool,
     wakers: Vec<Waker>,
 }
 
@@ -458,9 +466,19 @@ impl ReceivedPreface {
         PrefaceRecorder(self.clone())
     }
 
-    /// Whether the connection received all of it.
-    pub(crate) fn is_complete(&self) -> bool {
-        self.lock().complete
+    /// Whether the latest frame the connection received is part of it: a relaying caller
+    /// doesn't get it.
+    pub(crate) fn took_latest(&self) -> bool {
+        self.lock().took_latest
+    }
+
+    /// Notes that a caller relays the frames past it (see [`Self`]).
+    pub(crate) fn relayed(&self) {
+        let mut inner = self.lock();
+        inner.relayed = true;
+        for waker in inner.wakers.drain(..) {
+            waker.wake();
+        }
     }
 
     fn complete(&self) {
@@ -477,6 +495,18 @@ impl Future for ReceivedPreface {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.lock();
+        if !inner.complete
+            && inner.relayed
+            && inner
+                .frames
+                .iter()
+                .any(|frame| matches!(frame, LoggedFrame::Settings { ack: false, .. }))
+        {
+            inner.complete = true;
+            for waker in inner.wakers.drain(..) {
+                waker.wake();
+            }
+        }
         if inner.complete {
             return Poll::Ready(inner.frames.clone());
         }
@@ -498,8 +528,9 @@ const PREFACE_OCTETS: usize = 1 << 20;
 pub(crate) struct PrefaceRecorder(ReceivedPreface);
 
 impl PrefaceRecorder {
-    /// Records `frame`, received, unless it ends the preface (`None` is a frame of a kind
-    /// not logged, which does); returns whether the preface is complete.
+    /// Records `frame`, received, unless the preface is complete or the frame ends it
+    /// (`None` is a frame of a kind not logged, which does); returns whether it took it,
+    /// the preface being complete otherwise.
     pub(crate) fn record(&self, frame: Option<&LoggedFrame>) -> bool {
         let mut inner = self.0.lock();
         let octets = match frame {
@@ -508,20 +539,30 @@ impl PrefaceRecorder {
             Some(LoggedFrame::Unknown { payload, .. }) => Some(payload.len()),
             _ => None,
         };
-        match frame.zip(octets) {
+        inner.took_latest = match frame.zip(octets) {
             Some((frame, octets))
-                if inner.frames.len() < PREFACE_FRAMES && inner.octets < PREFACE_OCTETS =>
+                if !inner.complete
+                    && inner.frames.len() < PREFACE_FRAMES
+                    && inner.octets < PREFACE_OCTETS =>
             {
+                // A relaying caller waits for it to hold a SETTINGS frame.
+                if inner.relayed && matches!(frame, LoggedFrame::Settings { .. }) {
+                    for waker in inner.wakers.drain(..) {
+                        waker.wake();
+                    }
+                }
                 inner.frames.push(frame.clone());
                 inner.octets += octets;
-                false
-            }
-            _ => {
-                drop(inner);
-                self.0.complete();
                 true
             }
+            _ => false,
+        };
+        let took = inner.took_latest;
+        drop(inner);
+        if !took {
+            self.0.complete();
         }
+        took
     }
 }
 

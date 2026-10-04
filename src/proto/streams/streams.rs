@@ -123,6 +123,14 @@ struct Inner {
     /// newest last
     held: VecDeque<u32>,
 
+    /// The requests, numbered so, their clients reset before they went out here, each with
+    /// the reset's code (see [`Control::cancel_with`]), newest last
+    cancels: VecDeque<(u32, Reason)>,
+
+    /// The streams of requests that went out whole their clients reset since, to reset so
+    /// (see [`Control::cancel_with`])
+    resets: Vec<StreamId>,
+
     /// Whether a GOAWAY a [`Control`] queued went out: the connection's close sends none of
     /// its own then
     went_away: bool,
@@ -142,6 +150,9 @@ struct Inner {
 
     /// The tasks waiting for the frames a [`Control`] queued to go out (see [`Control::sent`])
     sent_tasks: Vec<Waker>,
+
+    /// The tasks waiting for those frames to leave room for more (see [`Control::poll_room`])
+    room_tasks: Vec<Waker>,
 
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
@@ -235,7 +246,7 @@ const RELAYED_FRAMES: usize = 1024;
 const RELAYED_OCTETS: usize = 1 << 20;
 
 /// How many frames a [`Control`] queued may await their turn, and the octets of their
-/// payloads, before it tells it lags (see [`Control::backlogged`]).
+/// payloads, before it has no room for more (see [`Control::poll_room`]).
 const CONTROL_FRAMES: usize = 4096;
 const CONTROL_OCTETS: usize = 1 << 20;
 
@@ -351,6 +362,12 @@ where
             inner: Arc::clone(&self.inner),
             after: 0,
         }
+    }
+
+    /// Ready once the data received and not yet released leaves room for more: the
+    /// connection reads no more frames meanwhile.
+    pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
+        self.inner.lock().actions.recv.poll_buffered_room(cx)
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -752,9 +769,31 @@ where
         me.refs += 1;
 
         let is_full = me.counts.next_send_stream_will_reach_capacity();
+        let opaque = OpaqueStreamRef::new(self.inner.clone(), &mut stream);
+        // Its client's reset, which came first, follows its HEADERS at once when it has no
+        // body, else its body's end (see `StreamRef::send_reset`).
+        if let Some(at) = recorded.and_then(|recorded| {
+            me.cancels
+                .iter()
+                .position(|(cancelled, _)| *cancelled == recorded)
+        }) {
+            let (_, reason) = me.cancels.remove(at).expect("a reset is pending");
+            stream.cancel_reason = Some(reason);
+            if end_of_stream {
+                if let Err(crate::proto::error::GoAway { .. }) = me.actions.send_reset(
+                    stream,
+                    reason,
+                    Initiator::User,
+                    &mut me.counts,
+                    send_buffer,
+                ) {
+                    unreachable!("Initiator::User should not error sending reset");
+                }
+            }
+        }
         Ok((
             StreamRef {
-                opaque: OpaqueStreamRef::new(self.inner.clone(), &mut stream),
+                opaque,
                 send_buffer: self.send_buffer.clone(),
             },
             is_full,
@@ -1144,14 +1183,28 @@ impl Control {
     }
 
     /// Makes the request recorded as `recorded`, if sent here, reset with `reason` rather
-    /// than its own should its handles be dropped before it ends or reset it.
+    /// than its own should its handles be dropped before it ends or reset it, at once if it
+    /// went out whole; if sent here later, reset so as it goes out when it has no body (see
+    /// [`Self::send_request`]).
     pub(crate) fn cancel_with(&self, recorded: u32, reason: Reason) {
         let mut me = self.inner.lock();
         let Some(id) = me.opened_stream(recorded) else {
+            if me.cancels.len() == RECORDED_STREAMS {
+                me.cancels.pop_front();
+            }
+            me.cancels.push_back((recorded, reason));
             return;
         };
+        let me = &mut *me;
         if let Some(mut stream) = me.store.find_mut(&id) {
             stream.cancel_reason = Some(reason);
+            // Its body, which would end with the reset, ended already.
+            if stream.state.is_send_closed() && !stream.state.is_closed() {
+                me.resets.push(id);
+                if let Some(task) = me.actions.task.take() {
+                    task.wake();
+                }
+            }
         }
     }
 
@@ -1168,6 +1221,7 @@ impl Control {
             ended: me.actions.conn_error.is_some(),
             ..RelayedQueue::default()
         }));
+        preface.relayed();
         me.relay = Some(Relay {
             frames: Arc::clone(&frames),
             preface,
@@ -1178,11 +1232,17 @@ impl Control {
         }
     }
 
-    /// Whether the frames it queued (see [`Queued`]) lag behind: as many, or as large, as it
-    /// lets wait their turn.
-    pub(crate) fn backlogged(&self) -> bool {
-        let me = self.inner.lock();
-        me.control.len() >= CONTROL_FRAMES || me.control_octets >= CONTROL_OCTETS
+    /// Ready once the frames it queued (see [`Queued`]) leave room for more, fewer and
+    /// smaller than it lets wait their turn, or the connection ended.
+    pub(crate) fn poll_room(&self, cx: &mut Context) -> Poll<()> {
+        let mut me = self.inner.lock();
+        if !me.backlogged() || me.actions.conn_error.is_some() {
+            return Poll::Ready(());
+        }
+        if !me.room_tasks.iter().any(|task| task.will_wake(cx.waker())) {
+            me.room_tasks.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// The flow-controlled octets of the DATA frames the connection sent so far.
@@ -1238,8 +1298,9 @@ impl Control {
 
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
     /// [`Inner::recorded_id`] does, its error code, its debug data, the open requests sent
-    /// here past that stream, which it leaves unprocessed, and the requests sent here whose
-    /// response frames received before it the caller didn't take yet, as recorded.
+    /// here past that stream, which it leaves unprocessed, and the requests sent here it
+    /// answered before it (their response heads, or resets, received, or frames the caller
+    /// didn't take yet), as recorded.
     pub(crate) fn on_go_away(
         &self,
         go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync + 'static,
@@ -1398,6 +1459,20 @@ impl Inner {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        for id in std::mem::take(&mut self.resets) {
+            if let Some(stream) = self.store.find_mut(&id) {
+                let reason = stream.cancel_reason.unwrap_or(Reason::CANCEL);
+                if let Err(crate::proto::error::GoAway { .. }) = self.actions.send_reset(
+                    stream,
+                    reason,
+                    Initiator::User,
+                    &mut self.counts,
+                    send_buffer,
+                ) {
+                    unreachable!("Initiator::User should not error sending reset");
+                }
+            }
+        }
         let mut at = 0;
         while let Some(queued) = self.control.get(at) {
             if !self.follows(queued.after) {
@@ -1423,7 +1498,18 @@ impl Inner {
                 }
             }
         }
+        if !self.backlogged() {
+            for task in self.room_tasks.drain(..) {
+                task.wake();
+            }
+        }
         Poll::Ready(Ok(()))
+    }
+
+    /// Whether the frames a [`Control`] queued are as many, or as large, as it lets wait
+    /// their turn.
+    fn backlogged(&self) -> bool {
+        self.control.len() >= CONTROL_FRAMES || self.control_octets >= CONTROL_OCTETS
     }
 
     /// The earliest relayed SETTINGS frame awaiting the relayed peer's acknowledgement, which
@@ -1602,14 +1688,14 @@ impl Inner {
 
     /// Hands `frame`, just received, to the caller relaying the frames past the peer's
     /// connection preface (see [`Control::relay_received`]), if there is one and the
-    /// preface is complete, a request's stream numbered as it was recorded (see
+    /// preface didn't take it, a request's stream numbered as it was recorded (see
     /// [`HeadersFrameOptions::recorded_stream_id`]); a WINDOW_UPDATE or unknown frame for a
     /// stream of no such request goes to no one. Whether it did; a caller gone relays nothing more.
     fn relay(&mut self, mut frame: LoggedFrame) -> bool {
         let Some(relay) = &self.relay else {
             return false;
         };
-        if !relay.preface.is_complete() {
+        if relay.preface.took_latest() {
             return false;
         }
         match &mut frame {
@@ -1814,12 +1900,15 @@ impl Inner {
             control: VecDeque::new(),
             released: VecDeque::new(),
             held: VecDeque::new(),
+            cancels: VecDeque::new(),
+            resets: Vec::new(),
             went_away: false,
             leaves_close: false,
             go_away_hook: None,
             error_hook: None,
             control_unflushed: false,
             sent_tasks: Vec::new(),
+            room_tasks: Vec::new(),
             frame_log: config.frame_log,
             received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
@@ -2176,14 +2265,16 @@ impl Inner {
                 .filter(|(_, opened)| *opened > last_stream_id && self.store.contains(opened))
                 .map(|(recorded, _)| *recorded)
                 .collect();
+            // The caller may have taken their frames yet not passed them on.
             let store = &mut self.store;
             let unread: Vec<u32> = self
                 .recorded_streams
                 .iter()
                 .filter(|(_, opened)| {
-                    store
-                        .find_mut(opened)
-                        .map_or(false, |stream| !stream.pending_recv.is_empty())
+                    *opened <= last_stream_id
+                        && store.find_mut(opened).map_or(true, |stream| {
+                            !stream.state.is_recv_headers() || !stream.pending_recv.is_empty()
+                        })
                 })
                 .map(|(recorded, _)| *recorded)
                 .collect();
@@ -2345,7 +2436,7 @@ impl Inner {
 
         tracing::trace!("Streams::recv_eof");
 
-        for task in self.sent_tasks.drain(..) {
+        for task in self.sent_tasks.drain(..).chain(self.room_tasks.drain(..)) {
             task.wake();
         }
         if let Some(relay) = self.relay.take() {

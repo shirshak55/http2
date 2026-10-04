@@ -224,6 +224,8 @@ where
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
         // No more of the peer's frames while the caller relaying them lags behind.
         ready!(self.inner.streams.as_dyn().poll_relay_room(cx));
+        // Nor while the data received waits to be taken (see `Recv::poll_buffered_room`).
+        ready!(self.inner.streams.poll_buffered_room(cx));
 
         Poll::Ready(Ok(()))
     }

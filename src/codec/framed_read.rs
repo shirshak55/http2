@@ -455,7 +455,7 @@ fn record(
     logged: Option<LoggedFrame>,
 ) {
     if let Some(recorder) = preface {
-        if recorder.record(logged.as_ref()) {
+        if !recorder.record(logged.as_ref()) {
             *preface = None;
         }
     }
