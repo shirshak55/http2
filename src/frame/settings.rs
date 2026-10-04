@@ -510,7 +510,7 @@ impl Settings {
         params
     }
 
-    fn payload_len(&self) -> usize {
+    pub(crate) fn payload_len(&self) -> usize {
         if let Some(wire) = &self.wire {
             return wire.len() * 6;
         }

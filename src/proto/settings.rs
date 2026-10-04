@@ -11,9 +11,9 @@ pub(crate) struct Settings {
     /// several may await one at once (RFC 9113 §6.5.3).
     to_send: VecDeque<frame::Settings>,
     /// Received SETTINGS frame pending processing, and whether it was relayed, which
-    /// leaves its ACK to the relayed peer (see `Control::relay_received`). The ACK must be
-    /// written to the socket first then the settings applied **before** receiving any
-    /// further frames.
+    /// leaves its ACK to the relayed peer (see `Control::relay_received`), and applying it
+    /// to when that ACK goes out. Otherwise the ACK must be written to the socket first then
+    /// the settings applied **before** receiving any further frames.
     remote: Option<(frame::Settings, bool)>,
     /// Whether the connection has received the initial SETTINGS frame from the
     /// remote peer.
@@ -113,29 +113,34 @@ impl Settings {
         P: Peer,
     {
         if let Some((settings, relayed)) = self.remote.clone() {
-            if !relayed && !streams.defer_settings_ack() {
-                if !dst.poll_ready(cx)?.is_ready() {
-                    return Poll::Pending;
+            let is_initial = self.mark_remote_initial_settings_as_received();
+            if relayed {
+                // It applies as the relayed peer's acknowledgement goes out.
+                streams.as_dyn().await_relayed_ack(settings);
+            } else {
+                if !streams.defer_settings_ack() {
+                    if !dst.poll_ready(cx)?.is_ready() {
+                        return Poll::Pending;
+                    }
+
+                    // Create an ACK settings frame
+                    let frame = frame::Settings::ack();
+
+                    // Buffer the settings frame
+                    dst.buffer(frame.into()).expect("invalid settings frame");
                 }
 
-                // Create an ACK settings frame
-                let frame = frame::Settings::ack();
+                tracing::trace!("ACK sent or deferred; applying settings");
 
-                // Buffer the settings frame
-                dst.buffer(frame.into()).expect("invalid settings frame");
-            }
+                streams.apply_remote_settings(&settings, is_initial)?;
 
-            tracing::trace!("ACK sent or deferred; applying settings");
+                if let Some(val) = settings.header_table_size() {
+                    dst.set_send_header_table_size(val as usize);
+                }
 
-            let is_initial = self.mark_remote_initial_settings_as_received();
-            streams.apply_remote_settings(&settings, is_initial)?;
-
-            if let Some(val) = settings.header_table_size() {
-                dst.set_send_header_table_size(val as usize);
-            }
-
-            if let Some(val) = settings.max_frame_size() {
-                dst.set_max_send_frame_size(val as usize);
+                if let Some(val) = settings.max_frame_size() {
+                    dst.set_max_send_frame_size(val as usize);
+                }
             }
         }
 

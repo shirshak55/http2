@@ -806,6 +806,9 @@ impl Prioritize {
                                     || padded_len > stream.send_flow.window_size() as usize)
                             {
                                 self.drop_padding(padded_len - sz, &mut stream, counts);
+                                if let Some(layout) = &stream.body_layout {
+                                    layout.padding_unsent(padded_len - sz);
+                                }
                                 frame.plan_mut()[0].padding = None;
                                 padding = None;
                             }

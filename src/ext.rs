@@ -181,6 +181,14 @@ pub trait BodyLayout: Send + Sync {
 
     /// Takes how the trailers' header block went, once it arrived.
     fn take_trailers(&self) -> Option<HeaderBlockEncoding>;
+
+    /// Tells that `octets` of the window the padding (its pad length field included) of
+    /// the frames [`Self::take`] gave would take won't be sent: padding the stream's window
+    /// or the frame size lacked room for, and that of frames whose data didn't go as they
+    /// did, or that came after the body's end.
+    fn padding_unsent(&self, octets: usize) {
+        let _ = octets;
+    }
 }
 
 /// How a response went on the wire: its header block, and its body, kept as it arrives.

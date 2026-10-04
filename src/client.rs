@@ -198,6 +198,23 @@ pub struct Control {
     preface: ReceivedPreface,
 }
 
+/// The frames the peer sends past its connection preface, for a caller relaying them (see
+/// [`Control::relay_received`]).
+#[derive(Debug)]
+pub struct RelayedFrames(proto::RelayedFrames);
+
+impl RelayedFrames {
+    /// The next frame, in the order received; `None` once the connection ended.
+    pub async fn recv(&mut self) -> Option<LoggedFrame> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    /// Polls for the next frame, in the order received; `None` once the connection ended.
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<LoggedFrame>> {
+        self.0.poll_recv(cx)
+    }
+}
+
 impl Control {
     /// A handle whose frames follow the request recorded as `recorded` (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)): each
@@ -234,13 +251,32 @@ impl Control {
     /// WINDOW_UPDATE for a stream of no such request isn't handed over. The connection
     /// then acknowledges neither those SETTINGS nor those PINGs itself:
     /// [`Self::send_settings_ack`] and [`Self::send_ping_ack`] relay the other peer's
-    /// acknowledgements. Once the receiver is dropped, it acknowledges them itself again.
-    /// The peer's acknowledgements of the SETTINGS and PINGs sent for the other peer
-    /// ([`Self::send_settings`], [`Self::send_ping`]) come too, in their place among
-    /// those frames, those received before the first call first; not those of the
-    /// connection's own preface, nor of the preface frames a request carried.
-    pub fn relay_received(&self) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
-        self.inner.relay_received(self.preface.clone())
+    /// acknowledgements, a relayed SETTINGS frame applying as its acknowledgement goes out.
+    /// Once the receiver is dropped, it acknowledges them itself again, those relayed whose
+    /// acknowledgements didn't come at once. The peer's acknowledgements of the SETTINGS and
+    /// PINGs sent for the other peer ([`Self::send_settings`], [`Self::send_ping`]) come
+    /// too, in their place among those frames, those received before the first call
+    /// first; not those of the connection's own preface, nor of the preface frames a
+    /// request carried. The receiver gets `None` once the connection ended; while it lags
+    /// behind (1,024 frames, or 1 MiB of unknown frames' payloads, or 1,024 relayed
+    /// SETTINGS awaiting acknowledgements), the connection reads no more of the peer's
+    /// frames.
+    pub fn relay_received(&self) -> RelayedFrames {
+        RelayedFrames(self.inner.relay_received(self.preface.clone()))
+    }
+
+    /// Whether the frames sent through its handles lag behind, awaiting their turn: 4,096
+    /// of them, or 1 MiB of their payloads.
+    pub fn backlogged(&self) -> bool {
+        self.inner.backlogged()
+    }
+
+    /// Whether the request recorded as `recorded` (see
+    /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)) went out
+    /// here with its body laid out as its [`SendBodyLayout`](crate::ext::SendBodyLayout)
+    /// said, so with the padding of the frames it gave.
+    pub fn lays_out_body(&self, recorded: u32) -> bool {
+        self.inner.lays_out_body(recorded)
     }
 
     /// Acknowledges the earliest relayed SETTINGS frame not yet acknowledged (see
@@ -351,9 +387,10 @@ impl Control {
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as the
     /// connection requests were recorded on numbered it (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the
-    /// latest request sent here on it or below it was, else as sent; its error code; and its
-    /// debug data.
-    pub fn on_go_away(&self, go_away: impl Fn(u32, Reason, Bytes) + Send + Sync + 'static) {
+    /// latest request sent here on it or below it was, else as sent; its error code; its
+    /// debug data; and the open requests sent here past it, which it leaves unprocessed,
+    /// as recorded.
+    pub fn on_go_away(&self, go_away: impl Fn(u32, Reason, Bytes, &[u32]) + Send + Sync + 'static) {
         self.inner.on_go_away(go_away);
     }
 

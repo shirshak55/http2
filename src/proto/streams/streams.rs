@@ -166,13 +166,47 @@ struct Inner {
     /// received before it relayed (see [`Control::relay_received`]), oldest first: it gets
     /// them first
     unrelayed_acks: VecDeque<LoggedFrame>,
+
+    /// The peer's SETTINGS relayed (see [`Control::relay_received`]) awaiting the relayed
+    /// peer's acknowledgements, oldest first: each applies as its acknowledgement goes out
+    relayed_settings: VecDeque<frame::Settings>,
+
+    /// The payloads of the peer's PINGs relayed awaiting the relayed peer's
+    /// acknowledgements, oldest first
+    relayed_peer_pings: VecDeque<[u8; 8]>,
+
+    /// The octets of the payloads of the frames queued in `control`
+    control_octets: usize,
 }
 
 /// Hands the peer's frames past its connection preface to a caller relaying them.
 #[derive(Debug)]
 struct Relay {
-    frames: tokio::sync::mpsc::UnboundedSender<LoggedFrame>,
+    frames: Arc<Mutex<RelayedQueue>>,
     preface: ReceivedPreface,
+}
+
+/// The frames received for a caller relaying them (see [`Control::relay_received`]).
+#[derive(Debug, Default)]
+struct RelayedQueue {
+    frames: VecDeque<LoggedFrame>,
+    /// The octets of the payloads of the unknown frames among them.
+    octets: usize,
+    /// Whether no more come: the connection ended.
+    ended: bool,
+    /// The caller's task waiting for them.
+    receiver: Option<Waker>,
+    /// The connection's task waiting for the caller to catch up (see
+    /// [`Streams::poll_relay_room`]).
+    reader: Option<Waker>,
+}
+
+/// The frames a [`Control::relay_received`] caller relays, as they come. Once dropped, the
+/// connection relays none any longer, and acknowledges itself the SETTINGS and PINGs
+/// relayed that the relayed peer didn't.
+pub(crate) struct RelayedFrames {
+    frames: Arc<Mutex<RelayedQueue>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 /// The PRIORITY_UPDATE frame type (RFC 9218).
@@ -181,6 +215,18 @@ const PRIORITY_UPDATE: u8 = 0x10;
 /// How many PINGs sent for a relaying caller await acknowledgements at most: the oldest
 /// past them is taken for unanswered.
 const RELAYED_PINGS: usize = 1024;
+
+/// How many frames received await the caller relaying them, or relayed SETTINGS the
+/// relayed peer's acknowledgements, at most, and the octets of the unknown frames'
+/// payloads among the former: past these the connection reads no more of the peer's
+/// frames until the caller catches up (see [`Streams::poll_relay_room`]).
+const RELAYED_FRAMES: usize = 1024;
+const RELAYED_OCTETS: usize = 1 << 20;
+
+/// How many frames a [`Control`] queued may await their turn, and the octets of their
+/// payloads, before it tells it lags (see [`Control::backlogged`]).
+const CONTROL_FRAMES: usize = 4096;
+const CONTROL_OCTETS: usize = 1 << 20;
 
 /// How many of the streams opened for requests carrying their recorded stream id are
 /// kept, to renumber the dependencies of the requests after them: those still open are
@@ -279,11 +325,13 @@ where
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+    ) -> Poll<Result<(), Error>>
     where
         T: AsyncWrite + Unpin,
     {
-        self.inner.lock().poll_control(cx, dst)
+        let mut me = self.inner.lock();
+        let mut send_buffer = self.send_buffer.inner.lock();
+        me.poll_control(&mut send_buffer, cx, dst)
     }
 
     /// A handle sending frames on this connection while it lives (see [`Control`]).
@@ -306,7 +354,7 @@ where
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+    ) -> Poll<Result<(), Error>>
     where
         T: AsyncWrite + Unpin,
     {
@@ -780,6 +828,32 @@ impl<B> DynStreams<'_, B> {
         });
     }
 
+    /// Keeps `settings`, the peer's relayed SETTINGS frame just received, to apply as the
+    /// relayed peer's acknowledgement of it goes out (see [`Control::send_settings_ack`]).
+    pub fn await_relayed_ack(&mut self, settings: frame::Settings) {
+        self.inner.lock().relayed_settings.push_back(settings);
+    }
+
+    /// Pending, `cx` woken once it catches up, while the caller relaying the peer's frames
+    /// (see [`Control::relay_received`]) lags behind them: while as many as it may hold
+    /// await it, or as many relayed SETTINGS or PINGs await the relayed peer's
+    /// acknowledgements. The connection reads no more of the peer's frames meanwhile.
+    pub fn poll_relay_room(&mut self, cx: &mut Context) -> Poll<()> {
+        let me = self.inner.lock();
+        let Some(relay) = &me.relay else {
+            return Poll::Ready(());
+        };
+        let mut queue = relay.frames.lock();
+        if queue.has_room()
+            && me.relayed_settings.len() < RELAYED_FRAMES
+            && me.relayed_peer_pings.len() < RELAYED_FRAMES
+        {
+            return Poll::Ready(());
+        }
+        queue.reader = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
         let mut me = self.inner.lock();
         me.recv_push_promise(self.send_buffer, frame)
@@ -826,9 +900,10 @@ pub(crate) struct Queued {
 }
 
 /// Called with the last stream, numbered as the connection requests were recorded on
-/// numbered it, the error code and the debug data of each GOAWAY the peer sends.
+/// numbered it, the error code and the debug data of each GOAWAY the peer sends, and the
+/// requests sent here it leaves unprocessed, as recorded.
 #[derive(Clone)]
-struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes) + std::marker::Send + Sync>);
+struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes, &[u32]) + std::marker::Send + Sync>);
 
 impl fmt::Debug for GoAwayHook {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -855,6 +930,98 @@ pub(crate) enum ControlFrame {
     WindowUpdate(u32, WindowSize),
     /// A GOAWAY frame's last stream id, error code and debug data.
     GoAway(u32, Reason, Bytes),
+}
+
+impl ControlFrame {
+    /// The octets of its payload.
+    fn octets(&self) -> usize {
+        match self {
+            ControlFrame::Settings(frame) => frame.payload_len(),
+            ControlFrame::Unknown(.., payload)
+            | ControlFrame::PriorityUpdate(_, payload)
+            | ControlFrame::GoAway(.., payload) => payload.len(),
+            _ => 0,
+        }
+    }
+}
+
+impl Relay {
+    /// Hands `frame` to the caller.
+    fn push(&self, frame: LoggedFrame) {
+        let mut queue = self.frames.lock();
+        if let LoggedFrame::Unknown { payload, .. } = &frame {
+            queue.octets += payload.len();
+        }
+        queue.frames.push_back(frame);
+        if let Some(receiver) = queue.receiver.take() {
+            receiver.wake();
+        }
+    }
+
+    /// Tells the caller no more frames come.
+    fn end(&self) {
+        let mut queue = self.frames.lock();
+        queue.ended = true;
+        if let Some(receiver) = queue.receiver.take() {
+            receiver.wake();
+        }
+    }
+
+    /// Wakes the connection's task should it wait for the caller to catch up.
+    fn wake_reader(&self) {
+        if let Some(reader) = self.frames.lock().reader.take() {
+            reader.wake();
+        }
+    }
+}
+
+impl RelayedQueue {
+    /// Whether it holds fewer frames than it may.
+    fn has_room(&self) -> bool {
+        self.frames.len() < RELAYED_FRAMES && self.octets < RELAYED_OCTETS
+    }
+}
+
+impl RelayedFrames {
+    /// The next frame, in the order received; `None` once the connection ended.
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<LoggedFrame>> {
+        let mut queue = self.frames.lock();
+        let Some(frame) = queue.frames.pop_front() else {
+            if queue.ended {
+                return Poll::Ready(None);
+            }
+            queue.receiver = Some(cx.waker().clone());
+            return Poll::Pending;
+        };
+        if let LoggedFrame::Unknown { payload, .. } = &frame {
+            queue.octets -= payload.len();
+        }
+        if queue.has_room() {
+            if let Some(reader) = queue.reader.take() {
+                reader.wake();
+            }
+        }
+        Poll::Ready(Some(frame))
+    }
+}
+
+impl fmt::Debug for RelayedFrames {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("RelayedFrames").finish_non_exhaustive()
+    }
+}
+
+impl Drop for RelayedFrames {
+    fn drop(&mut self) {
+        let mut me = self.inner.lock();
+        if me
+            .relay
+            .as_ref()
+            .map_or(false, |relay| Arc::ptr_eq(&relay.frames, &self.frames))
+        {
+            me.end_relay();
+        }
+    }
 }
 
 impl fmt::Debug for Control {
@@ -892,6 +1059,18 @@ impl Control {
 
     /// Queues the acknowledgement of a relayed PING carrying `payload`.
     pub(crate) fn send_ping_ack(&self, payload: [u8; 8]) {
+        let mut me = self.inner.lock();
+        if let Some(at) = me
+            .relayed_peer_pings
+            .iter()
+            .position(|sent| *sent == payload)
+        {
+            me.relayed_peer_pings.remove(at);
+            if let Some(relay) = &me.relay {
+                relay.wake_reader();
+            }
+        }
+        drop(me);
         self.queue(ControlFrame::Pong(payload));
     }
 
@@ -916,17 +1095,30 @@ impl Control {
 
     /// Hands the frames the peer sends past its connection `preface` from now on to the
     /// caller (see [`Inner::relay`]), which relays their acknowledgements.
-    pub(crate) fn relay_received(
-        &self,
-        preface: ReceivedPreface,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
-        let (frames, received) = tokio::sync::mpsc::unbounded_channel();
+    pub(crate) fn relay_received(&self, preface: ReceivedPreface) -> RelayedFrames {
         let mut me = self.inner.lock();
-        for ack in me.unrelayed_acks.drain(..) {
-            let _ = frames.send(ack);
+        let frames = Arc::new(Mutex::new(RelayedQueue {
+            frames: std::mem::take(&mut me.unrelayed_acks),
+            ended: me.actions.conn_error.is_some(),
+            ..RelayedQueue::default()
+        }));
+        if let Some(previous) = me.relay.replace(Relay {
+            frames: Arc::clone(&frames),
+            preface,
+        }) {
+            previous.end();
         }
-        me.relay = Some(Relay { frames, preface });
-        received
+        RelayedFrames {
+            frames,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Whether the frames it queued (see [`Queued`]) lag behind: as many, or as large, as it
+    /// lets wait their turn.
+    pub(crate) fn backlogged(&self) -> bool {
+        let me = self.inner.lock();
+        me.control.len() >= CONTROL_FRAMES || me.control_octets >= CONTROL_OCTETS
     }
 
     /// The flow-controlled octets of the DATA frames the connection sent so far.
@@ -981,10 +1173,11 @@ impl Control {
     }
 
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
-    /// [`Inner::recorded_id`] does, its error code and its debug data.
+    /// [`Inner::recorded_id`] does, its error code, its debug data, and the open requests
+    /// sent here past that stream, which it leaves unprocessed, as recorded.
     pub(crate) fn on_go_away(
         &self,
-        go_away: impl Fn(u32, Reason, Bytes) + std::marker::Send + Sync + 'static,
+        go_away: impl Fn(u32, Reason, Bytes, &[u32]) + std::marker::Send + Sync + 'static,
     ) {
         self.inner.lock().go_away_hook = Some(GoAwayHook(Arc::new(go_away)));
     }
@@ -1038,9 +1231,22 @@ impl Control {
         }
     }
 
+    /// Whether the request recorded as `recorded` went out here with its body laid out as
+    /// a [`SendBodyLayout`] said, so with the padding of the frames it gave.
+    pub(crate) fn lays_out_body(&self, recorded: u32) -> bool {
+        let mut me = self.inner.lock();
+        let Some(stream_id) = me.opened_stream(recorded) else {
+            return false;
+        };
+        me.store
+            .find_mut(&stream_id)
+            .map_or(false, |stream| stream.body_layout.is_some())
+    }
+
     /// Queues `frame` for the connection's task, waking it.
     fn queue(&self, frame: ControlFrame) {
         let mut me = self.inner.lock();
+        me.control_octets += frame.octets();
         me.control.push_back(Queued {
             after: self.after,
             frame,
@@ -1074,12 +1280,14 @@ fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
 }
 
 impl Inner {
-    /// Writes the queued frames (see [`Queued`]) whose turn came, in order.
+    /// Writes the queued frames (see [`Queued`]) whose turn came, in order, the relayed
+    /// SETTINGS an acknowledgement among them acknowledges applying as it goes.
     fn poll_control<T, B>(
         &mut self,
+        send_buffer: &mut Buffer<Frame<B>>,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+    ) -> Poll<Result<(), Error>>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
@@ -1090,13 +1298,75 @@ impl Inner {
             }
             ready!(dst.poll_ready(cx))?;
             let queued = self.control.pop_front().expect("a frame is queued");
+            self.control_octets -= queued.frame.octets();
+            let acknowledges = matches!(queued.frame, ControlFrame::SettingsAck);
             if let Some(frame) = self.control_frame(queued.frame) {
                 dst.buffer(leading_frame(frame))
                     .expect("invalid control frame");
                 self.control_unflushed = true;
             }
+            if acknowledges {
+                if let Some(settings) = self.relayed_settings.pop_front() {
+                    self.apply_relayed_settings(&settings, send_buffer, dst)?;
+                }
+            }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// Applies `settings`, a relayed SETTINGS frame of the peer's whose acknowledgement
+    /// just went out (see [`Control::send_settings_ack`]): the frames written from now on
+    /// follow it, those before didn't, as the peer expects.
+    fn apply_relayed_settings<T, B>(
+        &mut self,
+        settings: &frame::Settings,
+        send_buffer: &mut Buffer<Frame<B>>,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.counts.apply_remote_settings(settings, false);
+        self.actions.send.apply_remote_settings(
+            settings,
+            send_buffer,
+            &mut self.store,
+            &mut self.counts,
+            &mut self.actions.task,
+        )?;
+        if let Some(val) = settings.header_table_size() {
+            dst.set_send_header_table_size(val as usize);
+        }
+        if let Some(val) = settings.max_frame_size() {
+            dst.set_max_send_frame_size(val as usize);
+        }
+        if let Some(relay) = &self.relay {
+            relay.wake_reader();
+        }
+        Ok(())
+    }
+
+    /// Relays the peer's frames no longer (see [`Control::relay_received`]), acknowledging
+    /// the relayed SETTINGS and PINGs whose acknowledgements the relayed peer didn't send.
+    fn end_relay(&mut self) {
+        self.relay = None;
+        let queued = self
+            .control
+            .iter()
+            .filter(|queued| matches!(queued.frame, ControlFrame::SettingsAck))
+            .count();
+        let acks = self.relayed_settings.len().saturating_sub(queued);
+        let pongs = std::mem::take(&mut self.relayed_peer_pings);
+        self.control.extend(
+            std::iter::repeat_with(|| ControlFrame::SettingsAck)
+                .take(acks)
+                .chain(pongs.into_iter().map(ControlFrame::Pong))
+                .map(|frame| Queued { after: 0, frame }),
+        );
+        if let Some(task) = self.actions.task.take() {
+            task.wake();
+        }
     }
 
     /// Whether the frames following the request recorded as `after` may go out (see
@@ -1202,10 +1472,14 @@ impl Inner {
             }
             _ => {}
         }
-        if relay.frames.send(frame).is_err() {
-            self.relay = None;
-            return false;
+        if let LoggedFrame::Ping {
+            ack: false,
+            payload,
+        } = frame
+        {
+            self.relayed_peer_pings.push_back(payload);
         }
+        relay.push(frame);
         true
     }
 
@@ -1394,6 +1668,9 @@ impl Inner {
             relay: None,
             relayed_pings: VecDeque::new(),
             unrelayed_acks: VecDeque::new(),
+            relayed_settings: VecDeque::new(),
+            relayed_peer_pings: VecDeque::new(),
+            control_octets: 0,
         }))
     }
 
@@ -1708,6 +1985,10 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        // The caller relaying the peer's frames gets no more.
+        if let Some(relay) = self.relay.take() {
+            relay.end();
+        }
 
         last_processed_id
     }
@@ -1728,7 +2009,18 @@ impl Inner {
         actions.send.recv_go_away(last_stream_id)?;
 
         if let Some(hook) = &self.go_away_hook {
-            (hook.0)(recorded, frame.reason(), frame.debug_data().clone());
+            let refused: Vec<u32> = self
+                .recorded_streams
+                .iter()
+                .filter(|(_, opened)| *opened > last_stream_id && self.store.contains(opened))
+                .map(|(recorded, _)| *recorded)
+                .collect();
+            (hook.0)(
+                recorded,
+                frame.reason(),
+                frame.debug_data().clone(),
+                &refused,
+            );
         }
 
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
@@ -1883,6 +2175,9 @@ impl Inner {
         for task in self.sent_tasks.drain(..) {
             task.wake();
         }
+        if let Some(relay) = self.relay.take() {
+            relay.end();
+        }
 
         self.store.for_each(|stream| {
             counts.transition(stream, |counts, stream| {
@@ -1903,7 +2198,7 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+    ) -> Poll<Result<(), Error>>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
@@ -1912,7 +2207,7 @@ impl Inner {
         let send_buffer = &mut *send_buffer;
 
         // The caller's frames queued ahead of the HEADERS about to go out.
-        ready!(self.poll_control(cx, dst))?;
+        ready!(self.poll_control(send_buffer, cx, dst))?;
 
         // Send WINDOW_UPDATE frames first
         //
@@ -1933,7 +2228,7 @@ impl Inner {
         ))?;
 
         // Those following the HEADERS that just went out.
-        ready!(self.poll_control(cx, dst))?;
+        ready!(self.poll_control(send_buffer, cx, dst))?;
         if self.control_unflushed {
             ready!(dst.flush(cx))?;
             self.control_unflushed = false;
@@ -2137,7 +2432,16 @@ fn plan_data(
         received.index == index && received.len == 0 && !received.end_stream
     };
     pending.extend(layout.take((!end_stream).then_some(index)));
-    pending.retain(|received| received.index >= index);
+    // The padding of the frames whose data went otherwise, or that came after the body's
+    // end, goes nowhere.
+    let mut unsent = 0;
+    pending.retain(|received| {
+        let kept = received.index >= index;
+        if !kept {
+            unsent += padding_octets(received);
+        }
+        kept
+    });
     let mut plan = VecDeque::new();
     if len == 0 && !end_stream {
         // A chunk carrying nothing goes as the empty frame it stands for.
@@ -2161,18 +2465,33 @@ fn plan_data(
             padding: carrying.and_then(|received| received.padding),
         });
         if end_stream && len > 0 {
-            plan.extend(
-                pending
-                    .drain(..)
-                    .filter(|received| received.len == 0)
-                    .map(|received| planned(false, received)),
-            );
+            for received in pending.drain(..) {
+                if received.len == 0 {
+                    plan.push_back(planned(false, received));
+                } else {
+                    unsent += padding_octets(&received);
+                }
+            }
         }
+    }
+    if end_stream {
+        unsent += pending
+            .drain(..)
+            .map(|received| padding_octets(&received))
+            .sum::<usize>();
+    }
+    if unsent > 0 {
+        layout.padding_unsent(unsent);
     }
     if plan.iter().all(|frame| frame.padding.is_none()) && plan.len() <= 1 {
         plan.clear();
     }
     plan
+}
+
+/// The window `received`'s padding takes, its pad length field included.
+fn padding_octets(received: &DataFrame) -> usize {
+    received.padding.map_or(0, |pad| usize::from(pad) + 1)
 }
 
 impl<B> StreamRef<B> {
@@ -2226,12 +2545,20 @@ impl<B> StreamRef<B> {
             // Create the trailers frame
             let mut frame = frame::Headers::trailers(stream.id, trailers);
             frame.set_header_order(order);
-            if let Some(encoding) = stream
-                .body_layout
-                .as_ref()
-                .and_then(|layout| layout.take_trailers())
-            {
-                frame.set_encoding(encoding);
+            if let Some(layout) = stream.body_layout.clone() {
+                // The padding of its frames after the body's last data goes nowhere.
+                let unsent: usize = stream
+                    .body_frames
+                    .drain(..)
+                    .chain(layout.take(None))
+                    .map(|received| padding_octets(&received))
+                    .sum();
+                if unsent > 0 {
+                    layout.padding_unsent(unsent);
+                }
+                if let Some(encoding) = layout.take_trailers() {
+                    frame.set_encoding(encoding);
+                }
             }
 
             // Send the trailers frame

@@ -222,6 +222,8 @@ where
         // The caller's frames whose turn came (see `Control`).
         ready!(self.inner.streams.poll_control(cx, &mut self.codec))?;
         ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+        // No more of the peer's frames while the caller relaying them lags behind.
+        ready!(self.inner.streams.as_dyn().poll_relay_room(cx));
 
         Poll::Ready(Ok(()))
     }
@@ -308,7 +310,12 @@ where
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            if let Err(err) =
+                                ready!(self.inner.streams.poll_complete(cx, &mut self.codec))
+                            {
+                                self.inner.as_dyn().handle_poll2_result(Err(err))?;
+                                continue;
+                            }
 
                             if ((self.inner.error.is_some() && !self.inner.streams.leaves_close())
                                 || self.inner.go_away.should_close_on_idle())
