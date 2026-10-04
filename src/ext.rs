@@ -60,6 +60,15 @@ impl fmt::Debug for Protocol {
     }
 }
 
+/// Sends the request it is inserted into as an [Extended CONNECT Protocol] request with
+/// this `:protocol`: its `:method` is CONNECT, whatever method the request has. Lets a
+/// caller that treats a CONNECT request as an upgrade send an extended CONNECT as an
+/// ordinary request, its body the stream's DATA and its response's body the DATA back.
+///
+/// [Extended CONNECT Protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+#[derive(Clone, Debug)]
+pub struct ExtendedConnect(pub Protocol);
+
 /// The names of a message's header fields in the order its header block carries them,
 /// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
 ///

@@ -20,9 +20,9 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        BodyLayout, DataFrame, FollowingFrame, FrameLog, HeaderBlockEncoding, HeaderOrder,
-        HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, PrefaceFrame, Protocol,
-        ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
+        BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
+        HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo,
+        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -424,7 +424,11 @@ where
 
         use super::stream::ContentLength;
 
-        let protocol = request.extensions_mut().remove::<Protocol>();
+        let mut protocol = request.extensions_mut().remove::<Protocol>();
+        if let Some(ExtendedConnect(extended)) = request.extensions_mut().remove() {
+            *request.method_mut() = Method::CONNECT;
+            protocol = Some(extended);
+        }
         let order = request.extensions_mut().remove::<HeaderOrder>();
         let never_indexed = request.extensions_mut().remove::<NeverIndexedPseudo>();
         let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
