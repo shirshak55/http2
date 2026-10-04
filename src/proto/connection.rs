@@ -555,6 +555,9 @@ where
 
         // Reset all active streams
         self.streams.handle_error(e);
+        if initiator == Initiator::Library {
+            self.streams.connection_error(reason);
+        }
         self.go_away_now_data(reason, debug_data);
     }
 

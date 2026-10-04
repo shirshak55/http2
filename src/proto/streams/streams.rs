@@ -134,6 +134,9 @@ struct Inner {
     /// Called with each GOAWAY the peer sends (see [`Control::on_go_away`])
     go_away_hook: Option<GoAwayHook>,
 
+    /// Called on the connection error it detects (see [`Control::on_connection_error`])
+    error_hook: Option<ErrorHook>,
+
     /// Whether frames a [`Control`] queued were buffered since the codec was last flushed
     control_unflushed: bool,
 
@@ -810,6 +813,15 @@ impl<B> DynStreams<'_, B> {
         me.recv_go_away(self.send_buffer, frame)
     }
 
+    /// Tells the caller of the connection error the connection detected (see
+    /// [`Control::on_connection_error`]).
+    pub fn connection_error(&mut self, reason: Reason) {
+        let hook = self.inner.lock().error_hook.take();
+        if let Some(ErrorHook(hook)) = hook {
+            hook(reason);
+        }
+    }
+
     pub fn last_processed_id(&self) -> StreamId {
         self.inner.lock().actions.recv.last_processed_id()
     }
@@ -938,6 +950,16 @@ struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::
 impl fmt::Debug for GoAwayHook {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.pad("GoAwayHook(..)")
+    }
+}
+
+/// Called with the error code of the GOAWAY the connection sends on the connection error it
+/// detects.
+struct ErrorHook(Box<dyn FnOnce(Reason) + std::marker::Send>);
+
+impl fmt::Debug for ErrorHook {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.pad("ErrorHook(..)")
     }
 }
 
@@ -1219,6 +1241,15 @@ impl Control {
         go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync + 'static,
     ) {
         self.inner.lock().go_away_hook = Some(GoAwayHook(Arc::new(go_away)));
+    }
+
+    /// Calls `error` with the error code of the GOAWAY the connection sends on the
+    /// connection error it detects in what the peer sent, if it does.
+    pub(crate) fn on_connection_error(
+        &self,
+        error: impl FnOnce(Reason) + std::marker::Send + 'static,
+    ) {
+        self.inner.lock().error_hook = Some(ErrorHook(Box::new(error)));
     }
 
     /// Resolves once the frames queued (see [`Queued`]) went out on the transport, or the
@@ -1782,6 +1813,7 @@ impl Inner {
             went_away: false,
             leaves_close: false,
             go_away_hook: None,
+            error_hook: None,
             control_unflushed: false,
             sent_tasks: Vec::new(),
             frame_log: config.frame_log,

@@ -411,6 +411,13 @@ impl Control {
         self.inner.on_go_away(go_away);
     }
 
+    /// Calls `error` with the error code of the GOAWAY the connection sends on a connection
+    /// error it detects in what the peer sent (RFC 9113 §5.4.1), even with no stream open,
+    /// if it does.
+    pub fn on_connection_error(&self, error: impl FnOnce(Reason) + Send + 'static) {
+        self.inner.on_connection_error(error);
+    }
+
     /// Resolves once the frames sent through this connection's handles went out on its
     /// transport, or the connection ended.
     pub async fn sent(&self) {
