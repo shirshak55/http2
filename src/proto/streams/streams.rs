@@ -929,6 +929,11 @@ impl Control {
         received
     }
 
+    /// The flow-controlled octets of the DATA frames the connection sent so far.
+    pub(crate) fn data_sent(&self) -> u64 {
+        self.inner.lock().actions.send.data_sent()
+    }
+
     /// Whether the request recorded as `recorded` went out on this connection.
     pub(crate) fn carries(&self, recorded: u32) -> bool {
         self.inner.lock().opened_stream(recorded).is_some()

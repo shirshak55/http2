@@ -328,6 +328,12 @@ impl Control {
         self.inner.carries(recorded)
     }
 
+    /// The flow-controlled octets (padding included) of the DATA frames the connection
+    /// sent so far, which the server's connection WINDOW_UPDATEs grant back.
+    pub fn data_sent(&self) -> u64 {
+        self.inner.data_sent()
+    }
+
     /// Sends a GOAWAY frame of `reason` and `debug_data` naming `last_stream_id`, numbered
     /// as [`Self::send_priority`]'s streams are when it is a client-initiated one; the
     /// connection then closes without a GOAWAY of its own.

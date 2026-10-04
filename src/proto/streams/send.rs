@@ -66,6 +66,11 @@ impl Send {
         self.prioritize.headers_sent()
     }
 
+    /// The flow-controlled octets of the DATA frames sent so far.
+    pub fn data_sent(&self) -> u64 {
+        self.prioritize.data_sent()
+    }
+
     /// Returns the initial send window size
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz

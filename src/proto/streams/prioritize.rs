@@ -65,6 +65,9 @@ pub(super) struct Prioritize {
 
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
+
+    /// The flow-controlled octets of the DATA frames sent so far.
+    data_sent: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -112,12 +115,18 @@ impl Prioritize {
             sending_following: false,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
+            data_sent: 0,
         }
     }
 
     /// The newest stream whose HEADERS went out.
     pub(crate) fn headers_sent(&self) -> StreamId {
         self.headers_sent
+    }
+
+    /// The flow-controlled octets of the DATA frames sent so far.
+    pub(crate) fn data_sent(&self) -> u64 {
+        self.data_sent
     }
 
     pub(crate) fn max_buffer_size(&self) -> usize {
@@ -868,6 +877,7 @@ impl Prioritize {
                                 // TODO: proper error handling
                                 let _res = self.flow.send_data(flow_len);
                                 debug_assert!(_res.is_ok());
+                                self.data_sent += u64::from(flow_len);
 
                                 // Wrap the frame's data payload to ensure that the
                                 // correct amount of data gets written.
