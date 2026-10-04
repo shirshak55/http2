@@ -858,7 +858,7 @@ impl Control {
     }
 
     /// Makes the request recorded as `recorded`, if sent here, reset with `reason` rather
-    /// than CANCEL should its handles be dropped before it ends.
+    /// than its own should its handles be dropped before it ends or reset it.
     pub(crate) fn cancel_with(&self, recorded: u32, reason: Reason) {
         let mut me = self.inner.lock();
         let Some(id) = me.opened_stream(recorded) else {
@@ -2086,6 +2086,7 @@ impl<B> StreamRef<B> {
         let me = &mut *me;
 
         let stream = me.store.resolve(self.opaque.key);
+        let reason = stream.cancel_reason.unwrap_or(reason);
         let mut send_buffer = self.send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
 

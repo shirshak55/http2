@@ -116,8 +116,8 @@ pub(super) struct Stream {
     /// Whether the pushes promised on it are refused
     pub refuse_pushes: bool,
 
-    /// The reason it is reset with should its handles be dropped before it ends, CANCEL's
-    /// stead (see `Control::cancel_with`)
+    /// The reason it is reset with should its handles be dropped before it ends or reset
+    /// it, in their own's stead (see `Control::cancel_with`)
     pub cancel_reason: Option<Reason>,
 
     /// Validate content-length headers

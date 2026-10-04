@@ -265,8 +265,9 @@ impl Control {
 
     /// Makes the request recorded as `recorded` (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), if sent
-    /// here, reset with `reason` rather than CANCEL should it be dropped before it ends: as
-    /// the client it is relayed from reset it.
+    /// here, reset with `reason` should it be dropped before it ends (rather than CANCEL) or
+    /// reset (as [`SendStream::send_reset`] does, rather than its reason): as the client it
+    /// is relayed from reset it.
     pub fn cancel_with(&self, recorded: u32, reason: Reason) {
         self.inner.cancel_with(recorded, reason);
     }
