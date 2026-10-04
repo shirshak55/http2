@@ -1,5 +1,5 @@
 use super::{
-    util, GoAway, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate,
+    util, Data, GoAway, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate,
 };
 use crate::ext::{EncodedField, HeaderBlockEncoding, HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
@@ -55,6 +55,9 @@ pub(crate) enum Leading {
     /// The acknowledgement of the peer's relayed SETTINGS frame given, which applies to the
     /// frames after it (the HEADERS included) as it goes out.
     RelayedAck(Settings),
+    /// An empty DATA frame on this stream, padded by this pad length when given, ahead of
+    /// its trailers.
+    EmptyData(StreamId, Option<u8>),
 }
 
 impl Leading {
@@ -67,6 +70,11 @@ impl Leading {
             Self::Unknown(frame) => frame.encode(dst),
             Self::GoAway(frame) => frame.encode(dst),
             Self::RelayedAck(_) => Settings::ack().encode(dst),
+            Self::EmptyData(stream_id, padding) => {
+                let mut frame = Data::new(*stream_id, Bytes::new());
+                frame.set_padding(*padding);
+                frame.encode_chunk(dst);
+            }
         }
     }
 }
@@ -977,7 +985,11 @@ impl EncodingHeaderBlock {
 
         // Now, encode the header payload
         let room = dst.remaining_mut() - pad;
-        let len = self.fragments.pop_front().map_or(room, |len| len.min(room));
+        // The last recorded fragment takes the rest of a block re-encoded longer.
+        let len = match self.fragments.pop_front() {
+            Some(len) if !self.fragments.is_empty() => len.min(room),
+            _ => room,
+        };
         let continuation = if self.hpack.len() > len {
             dst.put((&mut self.hpack).take(len));
 
@@ -1233,7 +1245,9 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header, representation| {
+        // Its first fragment's, the HEADERS or PUSH_PROMISE frame's, opens it.
+        let first = self.received.fragments.len() == 1;
+        let res = decoder.decode_fragment(&mut cursor, first, |header, representation| {
             use crate::hpack::Header::*;
 
             // Recorded once known well-formed and within the list size, which charges it,
@@ -1299,9 +1313,17 @@ impl HeaderBlock {
             ControlFlow::Continue(())
         });
 
-        self.received
-            .size_updates
-            .extend(decoder.take_size_updates());
+        // Each size update counts as a field's overhead does, so a block can't take one
+        // after another without end.
+        let (size_updates, decoded) = decoder.take_size_updates();
+        for size in size_updates {
+            hpack::push_size_update(&mut self.received.size_updates, size);
+        }
+        let charge = decoded.saturating_mul(decoded_header_size(0, 0));
+        headers_size = headers_size.saturating_add(charge);
+        if check_size!().is_continue() && !self.is_over_size {
+            self.field_size += charge;
+        }
 
         match res {
             Ok(()) => {}

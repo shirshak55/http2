@@ -205,7 +205,8 @@ impl Prioritize {
         }
 
         // Update the buffered data counter, its padding counting as it does
-        stream.buffered_send_data += sz as usize + frame.planned_padding_len();
+        let padding = frame.planned_padding_len();
+        stream.buffered_send_data += sz as usize + padding;
 
         let _span =
             tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
@@ -241,7 +242,8 @@ impl Prioritize {
         // Sending out zero length data frames can be done to signal
         // end-of-stream.
         //
-        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
+        // Its planned padding aside: without the window for it, it goes unpadded.
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == padding {
             // The stream currently has capacity to send the data frame, so
             // queue it up and notify the connection task.
             self.queue_frame(frame.into(), buffer, stream, task);
@@ -386,6 +388,47 @@ impl Prioritize {
             debug_assert!(_res.is_ok());
             self.assign_connection_capacity(excess, stream, counts);
         }
+    }
+
+    /// Lets each empty DATA frame leading `headers`, a stream's trailers, take the window
+    /// its padding does from the stream's and the connection's, as a padded DATA frame
+    /// does, else go unpadded.
+    fn pad_leading_data(
+        &mut self,
+        headers: &mut frame::Headers,
+        stream: &mut store::Ptr,
+        max_len: usize,
+    ) {
+        let mut leading = headers.take_leading();
+        for frame in &mut leading {
+            let frame::Leading::EmptyData(_, padding) = frame else {
+                continue;
+            };
+            let Some(pad) = *padding else {
+                continue;
+            };
+            let len = WindowSize::from(pad) + 1;
+            if len as usize <= max_len
+                && len <= stream.send_flow.window_size()
+                && len <= self.flow.available().as_size()
+                && len <= self.flow.window_size()
+            {
+                // TODO: proper error handling
+                let _res = stream.send_flow.assign_capacity(len);
+                debug_assert!(_res.is_ok());
+                let _res = stream.send_flow.send_data(len);
+                debug_assert!(_res.is_ok());
+                let _res = self.flow.send_data(len);
+                debug_assert!(_res.is_ok());
+                self.data_sent += u64::from(len);
+            } else {
+                if let Some(layout) = &stream.body_layout {
+                    layout.padding_unsent(len as usize);
+                }
+                *padding = None;
+            }
+        }
+        headers.set_leading(leading);
     }
 
     /// Reclaim just reserved capacity, not buffered capacity, and re-assign
@@ -954,9 +997,10 @@ impl Prioritize {
                             }
                             Frame::PushPromise(pp)
                         }
-                        Some(frame) => {
-                            if let Frame::Headers(_) = frame {
+                        Some(mut frame) => {
+                            if let Frame::Headers(headers) = &mut frame {
                                 self.headers_sent = self.headers_sent.max(stream.id);
+                                self.pad_leading_data(headers, &mut stream, max_len);
                             } else {
                                 stream.following = stream.following.saturating_sub(1);
                             }

@@ -224,10 +224,45 @@ where
         }
     }
 
-    fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+    fn buffer(&mut self, mut item: Frame<B>) -> Result<(), UserError> {
         // Ensure that we have enough capacity to accept the write.
         assert!(self.has_capacity());
         let _span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
+
+        // A frame of a type HTTP/2 doesn't define larger than the peer takes can't go
+        // (RFC 9113 §4.2): it goes nowhere. Those leading a HEADERS frame go after a
+        // relayed SETTINGS acknowledgement among them applies.
+        match &mut item {
+            Frame::Unknown(v) if v.payload().len() > self.max_frame_size() => {
+                tracing::debug!(len = v.payload().len(), "unknown frame over max frame size");
+                return Ok(());
+            }
+            Frame::Headers(v) => {
+                let mut max = self.max_frame_size();
+                let leading = v
+                    .take_leading()
+                    .into_iter()
+                    .filter(|frame| match frame {
+                        frame::Leading::Unknown(f) if f.payload().len() > max => {
+                            tracing::debug!(
+                                len = f.payload().len(),
+                                "unknown frame over max frame size"
+                            );
+                            false
+                        }
+                        frame::Leading::RelayedAck(settings) => {
+                            if let Some(val) = settings.max_frame_size() {
+                                max = val as usize;
+                            }
+                            true
+                        }
+                        _ => true,
+                    })
+                    .collect();
+                v.set_leading(leading);
+            }
+            _ => {}
+        }
 
         tracing::debug!(frame = ?item, "send");
 
@@ -398,6 +433,8 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                         error_code: f.reason().into(),
                         debug_data: f.debug_data().clone(),
                     },
+                    // DATA isn't logged.
+                    frame::Leading::EmptyData(..) => continue,
                 });
             }
             LoggedFrame::Headers {

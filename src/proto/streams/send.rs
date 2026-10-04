@@ -94,7 +94,7 @@ impl Send {
         Ok(stream_id)
     }
 
-    fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
+    pub(super) fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
         // 8.1.2.2. Connection-Specific Header Fields
         if fields.contains_key(http::header::CONNECTION)
             || fields.contains_key(http::header::TRANSFER_ENCODING)
@@ -315,8 +315,12 @@ impl Send {
         // idle stream. HTTP/2 forbids that: §5.1 allows only HEADERS/PRIORITY
         // on idle streams and §6.4 says RST_STREAM on idle is a PROTOCOL_ERROR.
         // Keep the queued HEADERS so the stream opens, then send the reset
-        // immediately after.
-        if !stream.is_pending_open {
+        // immediately after. A stream taken off `pending_open` whose HEADERS didn't go out
+        // yet is no different (nor are the frames leading them, which aren't its own).
+        let headers_queued = stream.is_pending_open
+            || (counts.peer().is_local_init(stream.id)
+                && stream.id > self.prioritize.headers_sent());
+        if !headers_queued {
             // Otherwise, drop any buffered DATA/HEADERS and only send the
             // reset.
             //

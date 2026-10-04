@@ -21,8 +21,13 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
-    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`].
+    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`], at
+    /// most two kept (see [`push_size_update`]), and how many there were.
     size_updates: Vec<usize>,
+    size_updates_decoded: usize,
+    /// Whether the header block being decoded had a field, past which it may have no
+    /// dynamic table size update (RFC 7541 §4.2).
+    block_has_field: bool,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -164,12 +169,19 @@ impl Decoder {
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
             size_updates: Vec::new(),
+            size_updates_decoded: 0,
+            block_has_field: false,
         }
     }
 
-    /// The dynamic table size updates decoded since the last call, in order.
-    pub fn take_size_updates(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.size_updates)
+    /// The dynamic table size updates decoded since the last call, in order, more than
+    /// two as the smallest before the last and the last (see [`push_size_update`]), and
+    /// how many were decoded.
+    pub fn take_size_updates(&mut self) -> (Vec<usize>, usize) {
+        (
+            std::mem::take(&mut self.size_updates),
+            std::mem::take(&mut self.size_updates_decoded),
+        )
     }
 
     /// Queues a potential size update
@@ -184,9 +196,21 @@ impl Decoder {
     }
 
     /// Decodes the headers found in the given buffer.
-    pub fn decode<F>(
+    #[cfg(any(test, fuzzing))]
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header, FieldRepresentation) -> ControlFlow<()>,
+    {
+        self.decode_fragment(src, true, f)
+    }
+
+    /// Decodes the headers found in a header block's next fragment, its first when
+    /// `first`: dynamic table size updates may only open the block, whichever fragments
+    /// carry them.
+    pub fn decode_fragment<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
+        first: bool,
         mut f: F,
     ) -> Result<(), DecoderError>
     where
@@ -194,7 +218,9 @@ impl Decoder {
     {
         use self::Representation::*;
 
-        let mut can_resize = true;
+        if first {
+            self.block_has_field = false;
+        }
 
         if let Some(size) = self.max_size_update.take() {
             self.last_max_update = size;
@@ -211,7 +237,7 @@ impl Decoder {
             match Representation::load(ty)? {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (index, entry) = self.decode_indexed(src)?;
                     consume(src);
                     if f(entry, FieldRepresentation::Indexed(index)).is_break() {
@@ -220,7 +246,7 @@ impl Decoder {
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Incremental)?;
 
@@ -234,7 +260,7 @@ impl Decoder {
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Without)?;
                     consume(src);
@@ -244,7 +270,7 @@ impl Decoder {
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
+                    self.block_has_field = true;
                     let (entry, representation) =
                         self.decode_literal(src, LiteralIndexing::Never)?;
                     consume(src);
@@ -255,7 +281,7 @@ impl Decoder {
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
+                    if self.block_has_field {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 
@@ -283,7 +309,8 @@ impl Decoder {
         );
 
         self.table.set_max_size(new_size);
-        self.size_updates.push(new_size);
+        push_size_update(&mut self.size_updates, new_size);
+        self.size_updates_decoded += 1;
 
         Ok(())
     }
@@ -430,6 +457,18 @@ impl Representation {
         } else {
             Err(DecoderError::InvalidRepresentation)
         }
+    }
+}
+
+/// Appends `size`, a dynamic table size update, to those `updates` keeps of a header
+/// block's: past two, the smallest before the last and the last, all a decoder takes
+/// from them (RFC 7541 §4.2).
+pub(crate) fn push_size_update(updates: &mut Vec<usize>, size: usize) {
+    if let [smallest, last] = &mut updates[..] {
+        *smallest = (*smallest).min(*last);
+        *last = size;
+    } else {
+        updates.push(size);
     }
 }
 

@@ -248,19 +248,21 @@ impl Control {
     /// [`LoggedFrame`]s in the order received, a request's stream numbered as it was
     /// recorded (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)); a
-    /// WINDOW_UPDATE for a stream of no such request isn't handed over. The connection
+    /// WINDOW_UPDATE or unknown frame for a stream of no such request isn't handed over
+    /// (it would name another stream of the other peer's). The connection
     /// then acknowledges neither those SETTINGS nor those PINGs itself:
     /// [`Self::send_settings_ack`] and [`Self::send_ping_ack`] relay the other peer's
     /// acknowledgements, a relayed SETTINGS frame applying as its acknowledgement goes out.
-    /// Once the receiver is dropped, it acknowledges them itself again, those relayed whose
-    /// acknowledgements didn't come at once. The peer's acknowledgements of the SETTINGS and
+    /// Once the receiver is dropped, or another call replaces it (it then gets `None`), it
+    /// acknowledges them itself again, those relayed whose acknowledgements didn't come at
+    /// once. The peer's acknowledgements of the SETTINGS and
     /// PINGs sent for the other peer ([`Self::send_settings`], [`Self::send_ping`]) come
     /// too, in their place among those frames, those received before the first call
     /// first; not those of the connection's own preface, nor of the preface frames a
     /// request carried. The receiver gets `None` once the connection ended; while it lags
-    /// behind (1,024 frames, or 1 MiB of unknown frames' payloads, or 1,024 relayed
-    /// SETTINGS awaiting acknowledgements), the connection reads no more of the peer's
-    /// frames.
+    /// behind (1,024 frames, or 1 MiB of SETTINGS and unknown frames' payloads, or 1,024
+    /// relayed SETTINGS, or 1 MiB of their payloads, awaiting acknowledgements), the
+    /// connection reads no more of the peer's frames.
     pub fn relay_received(&self) -> RelayedFrames {
         RelayedFrames(self.inner.relay_received(self.preface.clone()))
     }
@@ -292,7 +294,8 @@ impl Control {
 
     /// Sends a frame of a type HTTP/2 doesn't define, of `kind`, `flags` and `payload`, on
     /// the connection (`stream_id` 0) or a stream numbered as [`Self::send_priority`]'s
-    /// streams are; not at all for a request this connection didn't send.
+    /// streams are; not at all for a request this connection didn't send, nor when
+    /// `payload` is longer than the peer's SETTINGS_MAX_FRAME_SIZE as it would go out.
     ///
     /// # Panics
     ///
@@ -379,8 +382,9 @@ impl Control {
     }
 
     /// Sends a GOAWAY frame of `reason` and `debug_data` naming `last_stream_id`, numbered
-    /// as [`Self::send_priority`]'s streams are when it is a client-initiated one; the
-    /// connection then closes without a GOAWAY of its own.
+    /// as [`Self::send_priority`]'s streams are when it is a client-initiated one, in place
+    /// of one sent before that didn't go out yet; the connection then closes without a
+    /// GOAWAY of its own.
     pub fn send_go_away(&self, last_stream_id: u32, reason: Reason, debug_data: &[u8]) {
         self.inner.send_go_away(last_stream_id, reason, debug_data);
     }
@@ -396,9 +400,14 @@ impl Control {
     /// connection requests were recorded on numbered it (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the
     /// latest request sent here on it or below it was, else as sent; its error code; its
-    /// debug data; and the open requests sent here past it, which it leaves unprocessed,
-    /// as recorded.
-    pub fn on_go_away(&self, go_away: impl Fn(u32, Reason, Bytes, &[u32]) + Send + Sync + 'static) {
+    /// debug data; the open requests sent here past it, which it leaves unprocessed; and
+    /// the requests sent here whose response frames (heads, data, trailers) received
+    /// before it the caller didn't take yet, which a client of the peer would get ahead of
+    /// it; requests as recorded.
+    pub fn on_go_away(
+        &self,
+        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + Send + Sync + 'static,
+    ) {
         self.inner.on_go_away(go_away);
     }
 

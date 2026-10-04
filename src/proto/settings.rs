@@ -113,8 +113,8 @@ impl Settings {
         P: Peer,
     {
         if let Some((settings, relayed)) = self.remote.clone() {
-            let is_initial = self.mark_remote_initial_settings_as_received();
             if relayed {
+                self.mark_remote_initial_settings_as_received();
                 // It applies as the relayed peer's acknowledgement goes out.
                 streams.as_dyn().await_relayed_ack(settings);
             } else {
@@ -132,6 +132,7 @@ impl Settings {
 
                 tracing::trace!("ACK sent or deferred; applying settings");
 
+                let is_initial = self.mark_remote_initial_settings_as_received();
                 streams.apply_remote_settings(&settings, is_initial)?;
 
                 if let Some(val) = settings.header_table_size() {

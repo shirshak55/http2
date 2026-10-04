@@ -128,12 +128,19 @@ impl Recv {
         self.stream_threshold
     }
 
-    /// Grows the connection's receive window by `increment`, which a WINDOW_UPDATE of our
-    /// own announces, leaving the unclaimed capacity as is.
-    pub fn inc_connection_window(&mut self, increment: WindowSize) -> Result<(), UserError> {
-        self.flow
-            .inc_recv_window(increment)
-            .map_err(|_| UserError::InvalidWindowUpdate)
+    /// Grows the connection's receive window by each of `increments`, which WINDOW_UPDATEs
+    /// of our own announce, leaving the unclaimed capacity as is; by none should one not fit.
+    pub fn inc_connection_window(
+        &mut self,
+        increments: impl IntoIterator<Item = WindowSize>,
+    ) -> Result<(), UserError> {
+        let mut flow = self.flow;
+        for increment in increments {
+            flow.inc_recv_window(increment)
+                .map_err(|_| UserError::InvalidWindowUpdate)?;
+        }
+        self.flow = flow;
+        Ok(())
     }
 
     /// Returns the ID of the last processed stream

@@ -176,6 +176,9 @@ struct Inner {
     /// peer's acknowledgements, oldest first: each applies as its acknowledgement goes out
     relayed_settings: VecDeque<frame::Settings>,
 
+    /// The octets of the payloads of `relayed_settings`
+    relayed_settings_octets: usize,
+
     /// The payloads of the peer's PINGs relayed awaiting the relayed peer's
     /// acknowledgements, oldest first
     relayed_peer_pings: VecDeque<[u8; 8]>,
@@ -195,7 +198,7 @@ struct Relay {
 #[derive(Debug, Default)]
 struct RelayedQueue {
     frames: VecDeque<LoggedFrame>,
-    /// The octets of the payloads of the unknown frames among them.
+    /// The octets of the payloads of the SETTINGS and unknown frames among them.
     octets: usize,
     /// Whether no more come: the connection ended.
     ended: bool,
@@ -222,9 +225,9 @@ const PRIORITY_UPDATE: u8 = 0x10;
 const RELAYED_PINGS: usize = 1024;
 
 /// How many frames received await the caller relaying them, or relayed SETTINGS the
-/// relayed peer's acknowledgements, at most, and the octets of the unknown frames'
-/// payloads among the former: past these the connection reads no more of the peer's
-/// frames until the caller catches up (see [`Streams::poll_relay_room`]).
+/// relayed peer's acknowledgements, at most, and the octets of the payloads of the
+/// SETTINGS and unknown frames among either: past these the connection reads no more of
+/// the peer's frames until the caller catches up (see [`Streams::poll_relay_room`]).
 const RELAYED_FRAMES: usize = 1024;
 const RELAYED_OCTETS: usize = 1 << 20;
 
@@ -541,13 +544,86 @@ where
                 Vec::new(),
             ),
         };
+        let mut headers = client::Peer::convert_send_message(
+            stream_id,
+            request,
+            protocol,
+            order,
+            end_of_stream,
+            pseudo_order,
+            stream_dependency,
+        )?;
+        if let Some(NeverIndexedPseudo(never_indexed)) = never_indexed {
+            headers.set_never_indexed(never_indexed);
+        }
+        if let Some(encoding) = encoding {
+            headers.set_encoding(encoding);
+        }
+        Send::check_headers(headers.fields())?;
+
+        let following: Vec<FollowingFrame> = following
+            .into_iter()
+            .filter_map(|frame| {
+                Some(match frame {
+                    FollowingFrame::Priority(priority) => {
+                        FollowingFrame::Priority(renumber(&me, priority)?)
+                    }
+                    FollowingFrame::Unknown {
+                        kind: PRIORITY_UPDATE,
+                        flags,
+                        on_stream: false,
+                        payload,
+                    } => FollowingFrame::Unknown {
+                        kind: PRIORITY_UPDATE,
+                        flags,
+                        on_stream: false,
+                        payload: match recorded {
+                            Some(recorded) => {
+                                me.renumber_priority_update(payload, recorded, stream_id)?
+                            }
+                            None => payload,
+                        },
+                    },
+                    frame => frame,
+                })
+            })
+            .collect();
+        let following = following
+            .into_iter()
+            .map(|frame| match frame {
+                FollowingFrame::WindowUpdate(increment) => {
+                    stream
+                        .recv_flow
+                        .inc_recv_window(increment)
+                        .map_err(|_| UserError::InvalidWindowUpdate)?;
+                    Ok(frame::WindowUpdate::new(stream_id, increment).into())
+                }
+                FollowingFrame::Priority(priority) => Ok(priority.into()),
+                FollowingFrame::Unknown {
+                    kind,
+                    flags,
+                    on_stream,
+                    payload,
+                } => {
+                    if payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
+                        return Err(UserError::PayloadTooBig);
+                    }
+                    let stream_id = if on_stream { stream_id.into() } else { 0 };
+                    Ok(frame::Unknown::new(kind, flags, stream_id, payload).into())
+                }
+            })
+            .collect::<Result<Vec<Frame<B>>, UserError>>()?;
+
         // The next request carries the frames waiting for it (the first request, the
-        // preface frames), numbered as it was recorded.
+        // preface frames), numbered as it was recorded. Nothing is taken from the
+        // connection before all that can fail did not, so a request failing loses none of
+        // those frames.
         let mut leading_frames = Vec::new();
-        for frame in std::mem::take(&mut me.preface_frames) {
-            leading_frames.push(match frame {
+        let mut window_increments = Vec::new();
+        for frame in &me.preface_frames {
+            leading_frames.push(match frame.clone() {
                 PrefaceFrame::WindowUpdate(increment) => {
-                    me.actions.recv.inc_connection_window(increment)?;
+                    window_increments.push(increment);
                     frame::Leading::WindowUpdate(frame::WindowUpdate::new(
                         StreamId::ZERO,
                         increment,
@@ -579,36 +655,11 @@ where
                 }
             });
         }
+        me.actions.recv.inc_connection_window(window_increments)?;
+        me.preface_frames.clear();
         for _ in 0..std::mem::take(&mut me.settings_acks) {
             leading_frames.push(frame::Leading::Settings(frame::Settings::ack()));
         }
-        let following: Vec<FollowingFrame> = following
-            .into_iter()
-            .filter_map(|frame| {
-                Some(match frame {
-                    FollowingFrame::Priority(priority) => {
-                        FollowingFrame::Priority(renumber(&me, priority)?)
-                    }
-                    FollowingFrame::Unknown {
-                        kind: PRIORITY_UPDATE,
-                        flags,
-                        on_stream: false,
-                        payload,
-                    } => FollowingFrame::Unknown {
-                        kind: PRIORITY_UPDATE,
-                        flags,
-                        on_stream: false,
-                        payload: match recorded {
-                            Some(recorded) => {
-                                me.renumber_priority_update(payload, recorded, stream_id)?
-                            }
-                            None => payload,
-                        },
-                    },
-                    frame => frame,
-                })
-            })
-            .collect();
         if let Some(recorded) = recorded {
             // Only closed streams' entries go, oldest first: an open one's frames need its.
             let mut excess = (me.recorded_streams.len() + 1).saturating_sub(RECORDED_STREAMS);
@@ -631,7 +682,7 @@ where
                 let queued = me.control.remove(at).expect("a frame is queued");
                 me.control_octets -= queued.frame.octets();
                 let frame = match queued.frame {
-                    ControlFrame::SettingsAck => match me.relayed_settings.pop_front() {
+                    ControlFrame::SettingsAck => match me.pop_relayed_settings() {
                         Some(settings) => Some(frame::Leading::RelayedAck(settings)),
                         None => me.control_frame(ControlFrame::SettingsAck),
                     },
@@ -646,47 +697,6 @@ where
                 .into_iter()
                 .filter_map(|priority| renumber(&me, priority).map(frame::Leading::Priority)),
         );
-        let mut headers = client::Peer::convert_send_message(
-            stream_id,
-            request,
-            protocol,
-            order,
-            end_of_stream,
-            pseudo_order,
-            stream_dependency,
-        )?;
-        if let Some(NeverIndexedPseudo(never_indexed)) = never_indexed {
-            headers.set_never_indexed(never_indexed);
-        }
-        if let Some(encoding) = encoding {
-            headers.set_encoding(encoding);
-        }
-
-        let following = following
-            .into_iter()
-            .map(|frame| match frame {
-                FollowingFrame::WindowUpdate(increment) => {
-                    stream
-                        .recv_flow
-                        .inc_recv_window(increment)
-                        .map_err(|_| UserError::InvalidWindowUpdate)?;
-                    Ok(frame::WindowUpdate::new(stream_id, increment).into())
-                }
-                FollowingFrame::Priority(priority) => Ok(priority.into()),
-                FollowingFrame::Unknown {
-                    kind,
-                    flags,
-                    on_stream,
-                    payload,
-                } => {
-                    if payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
-                        return Err(UserError::PayloadTooBig);
-                    }
-                    let stream_id = if on_stream { stream_id.into() } else { 0 };
-                    Ok(frame::Unknown::new(kind, flags, stream_id, payload).into())
-                }
-            })
-            .collect::<Result<Vec<Frame<B>>, UserError>>()?;
 
         if let Some(log) = &me.frame_log {
             stream.sent_headers = Some(HeadersFrame {
@@ -847,7 +857,9 @@ impl<B> DynStreams<'_, B> {
     /// Keeps `settings`, the peer's relayed SETTINGS frame just received, to apply as the
     /// relayed peer's acknowledgement of it goes out (see [`Control::send_settings_ack`]).
     pub fn await_relayed_ack(&mut self, settings: frame::Settings) {
-        self.inner.lock().relayed_settings.push_back(settings);
+        let mut me = self.inner.lock();
+        me.relayed_settings_octets += settings.payload_len();
+        me.relayed_settings.push_back(settings);
     }
 
     /// Pending, `cx` woken once it catches up, while the caller relaying the peer's frames
@@ -862,6 +874,7 @@ impl<B> DynStreams<'_, B> {
         let mut queue = relay.frames.lock();
         if queue.has_room()
             && me.relayed_settings.len() < RELAYED_FRAMES
+            && me.relayed_settings_octets < RELAYED_OCTETS
             && me.relayed_peer_pings.len() < RELAYED_FRAMES
         {
             return Poll::Ready(());
@@ -916,10 +929,11 @@ pub(crate) struct Queued {
 }
 
 /// Called with the last stream, numbered as the connection requests were recorded on
-/// numbered it, the error code and the debug data of each GOAWAY the peer sends, and the
-/// requests sent here it leaves unprocessed, as recorded.
+/// numbered it, the error code and the debug data of each GOAWAY the peer sends, the
+/// requests sent here it leaves unprocessed, and those whose response frames received
+/// before it the caller didn't take yet, as recorded.
 #[derive(Clone)]
-struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes, &[u32]) + std::marker::Send + Sync>);
+struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync>);
 
 impl fmt::Debug for GoAwayHook {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -965,9 +979,7 @@ impl Relay {
     /// Hands `frame` to the caller.
     fn push(&self, frame: LoggedFrame) {
         let mut queue = self.frames.lock();
-        if let LoggedFrame::Unknown { payload, .. } = &frame {
-            queue.octets += payload.len();
-        }
+        queue.octets += relayed_octets(&frame);
         queue.frames.push_back(frame);
         if let Some(receiver) = queue.receiver.take() {
             receiver.wake();
@@ -991,6 +1003,16 @@ impl Relay {
     }
 }
 
+/// The octets of `frame`'s payload that a relaying caller's budget counts: a SETTINGS
+/// frame's or an unknown frame's.
+fn relayed_octets(frame: &LoggedFrame) -> usize {
+    match frame {
+        LoggedFrame::Settings { params, .. } => params.len() * 6,
+        LoggedFrame::Unknown { payload, .. } => payload.len(),
+        _ => 0,
+    }
+}
+
 impl RelayedQueue {
     /// Whether it holds fewer frames than it may.
     fn has_room(&self) -> bool {
@@ -1009,9 +1031,7 @@ impl RelayedFrames {
             queue.receiver = Some(cx.waker().clone());
             return Poll::Pending;
         };
-        if let LoggedFrame::Unknown { payload, .. } = &frame {
-            queue.octets -= payload.len();
-        }
+        queue.octets -= relayed_octets(&frame);
         if queue.has_room() {
             if let Some(reader) = queue.reader.take() {
                 reader.wake();
@@ -1113,17 +1133,19 @@ impl Control {
     /// caller (see [`Inner::relay`]), which relays their acknowledgements.
     pub(crate) fn relay_received(&self, preface: ReceivedPreface) -> RelayedFrames {
         let mut me = self.inner.lock();
+        // The caller relaying so far relays no more, as though it dropped its frames.
+        if me.relay.is_some() {
+            me.end_relay();
+        }
         let frames = Arc::new(Mutex::new(RelayedQueue {
             frames: std::mem::take(&mut me.unrelayed_acks),
             ended: me.actions.conn_error.is_some(),
             ..RelayedQueue::default()
         }));
-        if let Some(previous) = me.relay.replace(Relay {
+        me.relay = Some(Relay {
             frames: Arc::clone(&frames),
             preface,
-        }) {
-            previous.end();
-        }
+        });
         RelayedFrames {
             frames,
             inner: Arc::clone(&self.inner),
@@ -1189,11 +1211,12 @@ impl Control {
     }
 
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
-    /// [`Inner::recorded_id`] does, its error code, its debug data, and the open requests
-    /// sent here past that stream, which it leaves unprocessed, as recorded.
+    /// [`Inner::recorded_id`] does, its error code, its debug data, the open requests sent
+    /// here past that stream, which it leaves unprocessed, and the requests sent here whose
+    /// response frames received before it the caller didn't take yet, as recorded.
     pub(crate) fn on_go_away(
         &self,
-        go_away: impl Fn(u32, Reason, Bytes, &[u32]) + std::marker::Send + Sync + 'static,
+        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync + 'static,
     ) {
         self.inner.lock().go_away_hook = Some(GoAwayHook(Arc::new(go_away)));
     }
@@ -1281,6 +1304,17 @@ impl Control {
     /// Queues `frame` for the connection's task, waking it.
     fn queue(&self, frame: ControlFrame) {
         let mut me = self.inner.lock();
+        // A GOAWAY supersedes one queued that didn't go out yet (RFC 9113 §6.8).
+        if matches!(frame, ControlFrame::GoAway(..)) {
+            if let Some(at) = me
+                .control
+                .iter()
+                .position(|queued| matches!(queued.frame, ControlFrame::GoAway(..)))
+            {
+                let superseded = me.control.remove(at).expect("a frame is queued");
+                me.control_octets -= superseded.frame.octets();
+            }
+        }
         me.control_octets += frame.octets();
         me.control.push_back(Queued {
             after: self.after,
@@ -1312,6 +1346,7 @@ fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
         frame::Leading::Unknown(frame) => frame.into(),
         frame::Leading::GoAway(frame) => frame.into(),
         frame::Leading::RelayedAck(_) => frame::Settings::ack().into(),
+        frame::Leading::EmptyData(..) => unreachable!("a control frame is no DATA frame"),
     }
 }
 
@@ -1348,12 +1383,20 @@ impl Inner {
                 self.control_unflushed = true;
             }
             if acknowledges {
-                if let Some(settings) = self.relayed_settings.pop_front() {
+                if let Some(settings) = self.pop_relayed_settings() {
                     self.apply_relayed_settings(&settings, send_buffer, dst)?;
                 }
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// The earliest relayed SETTINGS frame awaiting the relayed peer's acknowledgement, which
+    /// its acknowledgement going out takes.
+    fn pop_relayed_settings(&mut self) -> Option<frame::Settings> {
+        let settings = self.relayed_settings.pop_front()?;
+        self.relayed_settings_octets -= settings.payload_len();
+        Some(settings)
     }
 
     /// Applies `settings`, a relayed SETTINGS frame of the peer's whose acknowledgement
@@ -1402,7 +1445,10 @@ impl Inner {
     /// Relays the peer's frames no longer (see [`Control::relay_received`]), acknowledging
     /// the relayed SETTINGS and PINGs whose acknowledgements the relayed peer didn't send.
     fn end_relay(&mut self) {
-        self.relay = None;
+        if let Some(relay) = self.relay.take() {
+            relay.end();
+            relay.wake_reader();
+        }
         let queued = self
             .control
             .iter()
@@ -1410,12 +1456,14 @@ impl Inner {
             .count();
         let acks = self.relayed_settings.len().saturating_sub(queued);
         let pongs = std::mem::take(&mut self.relayed_peer_pings);
-        self.control.extend(
-            std::iter::repeat_with(|| ControlFrame::SettingsAck)
-                .take(acks)
-                .chain(pongs.into_iter().map(ControlFrame::Pong))
-                .map(|frame| Queued { after: 0, frame }),
-        );
+        // Ahead of the frames queued, which may wait for a request that never opens.
+        let mut control: VecDeque<Queued> = std::iter::repeat_with(|| ControlFrame::SettingsAck)
+            .take(acks)
+            .chain(pongs.into_iter().map(ControlFrame::Pong))
+            .map(|frame| Queued { after: 0, frame })
+            .collect();
+        control.append(&mut self.control);
+        self.control = control;
         if let Some(task) = self.actions.task.take() {
             task.wake();
         }
@@ -1492,7 +1540,7 @@ impl Inner {
                 frame::Leading::Unknown(frame::Unknown::new(PRIORITY_UPDATE, 0, 0, payload.into()))
             }
             ControlFrame::WindowUpdate(0, increment) => {
-                self.actions.recv.inc_connection_window(increment).ok()?;
+                self.actions.recv.inc_connection_window([increment]).ok()?;
                 frame::Leading::WindowUpdate(frame::WindowUpdate::new(StreamId::ZERO, increment))
             }
             ControlFrame::WindowUpdate(stream_id, increment) => {
@@ -1520,8 +1568,8 @@ impl Inner {
     /// Hands `frame`, just received, to the caller relaying the frames past the peer's
     /// connection preface (see [`Control::relay_received`]), if there is one and the
     /// preface is complete, a request's stream numbered as it was recorded (see
-    /// [`HeadersFrameOptions::recorded_stream_id`]); a WINDOW_UPDATE for a stream of no
-    /// such request goes to no one. Whether it did; a caller gone relays nothing more.
+    /// [`HeadersFrameOptions::recorded_stream_id`]); a WINDOW_UPDATE or unknown frame for a
+    /// stream of no such request goes to no one. Whether it did; a caller gone relays nothing more.
     fn relay(&mut self, mut frame: LoggedFrame) -> bool {
         let Some(relay) = &self.relay else {
             return false;
@@ -1530,15 +1578,19 @@ impl Inner {
             return false;
         }
         match &mut frame {
-            LoggedFrame::WindowUpdate { stream_id, .. } if *stream_id != 0 => {
+            LoggedFrame::WindowUpdate { stream_id, .. }
+            | LoggedFrame::Unknown { stream_id, .. }
+                if *stream_id != 0 =>
+            {
                 match self.recorded_request(StreamId::from(*stream_id)) {
                     Some(recorded) => *stream_id = recorded,
-                    None => return false,
-                }
-            }
-            LoggedFrame::Unknown { stream_id, .. } if *stream_id != 0 => {
-                if let Some(recorded) = self.recorded_request(StreamId::from(*stream_id)) {
-                    *stream_id = recorded;
+                    None => {
+                        tracing::debug!(
+                            stream_id = *stream_id,
+                            "frame on a stream of no recorded request"
+                        );
+                        return false;
+                    }
                 }
             }
             _ => {}
@@ -1741,6 +1793,7 @@ impl Inner {
             relayed_pings: VecDeque::new(),
             unrelayed_acks: VecDeque::new(),
             relayed_settings: VecDeque::new(),
+            relayed_settings_octets: 0,
             relayed_peer_pings: VecDeque::new(),
             control_octets: 0,
         }))
@@ -2087,11 +2140,23 @@ impl Inner {
                 .filter(|(_, opened)| *opened > last_stream_id && self.store.contains(opened))
                 .map(|(recorded, _)| *recorded)
                 .collect();
+            let store = &mut self.store;
+            let unread: Vec<u32> = self
+                .recorded_streams
+                .iter()
+                .filter(|(_, opened)| {
+                    store
+                        .find_mut(opened)
+                        .map_or(false, |stream| !stream.pending_recv.is_empty())
+                })
+                .map(|(recorded, _)| *recorded)
+                .collect();
             (hook.0)(
                 recorded,
                 frame.reason(),
                 frame.debug_data().clone(),
                 &refused,
+                &unread,
             );
         }
 
@@ -2628,13 +2693,19 @@ impl<B> StreamRef<B> {
             let mut frame = frame::Headers::trailers(stream.id, trailers);
             frame.set_header_order(order);
             if let Some(layout) = stream.body_layout.clone() {
-                // The padding of its frames after the body's last data goes nowhere.
-                let unsent: usize = stream
-                    .body_frames
-                    .drain(..)
-                    .chain(layout.take(None))
-                    .map(|received| padding_octets(&received))
-                    .sum();
+                // The empty frames after the body's last data go right ahead of them; the
+                // padding of the others left goes nowhere.
+                let id = stream.id;
+                let mut empty = Vec::new();
+                let mut unsent = 0;
+                for received in stream.body_frames.drain(..).chain(layout.take(None)) {
+                    if received.len == 0 && !received.end_stream {
+                        empty.push(frame::Leading::EmptyData(id, received.padding));
+                    } else {
+                        unsent += padding_octets(&received);
+                    }
+                }
+                frame.set_leading(empty);
                 if unsent > 0 {
                     layout.padding_unsent(unsent);
                 }

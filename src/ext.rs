@@ -417,11 +417,13 @@ impl FrameLog {
     }
 }
 
-/// The connection preface a client connection's peer sent — its SETTINGS and the
-/// connection WINDOW_UPDATEs and frames of types HTTP/2 doesn't define after it — as
+/// The connection preface a client connection's peer sent — its SETTINGS frames, each of
+/// which the connection acknowledges and applies itself, and the connection
+/// WINDOW_UPDATEs and frames of types HTTP/2 doesn't define among and after them — as
 /// [`LoggedFrame`]s in wire order, once the connection received all of it: the peer's
-/// SETTINGS ACK or a frame of any other kind ends it (and isn't part of it), as does the
-/// connection's end (then it holds what arrived: nothing when the peer sent no SETTINGS).
+/// SETTINGS ACK or a frame of any other kind ends it (and isn't part of it), as does one
+/// past 1,024 frames or 1 MiB of their payloads, or the connection's end (then it holds
+/// what arrived: nothing when the peer sent no SETTINGS).
 ///
 /// Resolves as soon as it is complete, ahead of any response; see
 /// [`Control::received_preface`](crate::client::Control::received_preface).
@@ -431,6 +433,8 @@ pub struct ReceivedPreface(Arc<Mutex<ReceivedPrefaceInner>>);
 #[derive(Debug, Default)]
 struct ReceivedPrefaceInner {
     frames: Vec<LoggedFrame>,
+    /// The octets of their payloads.
+    octets: usize,
     complete: bool,
     wakers: Vec<Waker>,
 }
@@ -474,6 +478,11 @@ impl Future for ReceivedPreface {
     }
 }
 
+/// How many frames, and octets of their payloads, a [`ReceivedPreface`] holds before the
+/// next frame ends it.
+const PREFACE_FRAMES: usize = 1024;
+const PREFACE_OCTETS: usize = 1 << 20;
+
 /// Records a connection's received frames into its [`ReceivedPreface`] until it is
 /// complete; dropped (the connection ended, or the preface is complete), it completes it.
 #[derive(Debug)]
@@ -484,13 +493,18 @@ impl PrefaceRecorder {
     /// not logged, which does); returns whether the preface is complete.
     pub(crate) fn record(&self, frame: Option<&LoggedFrame>) -> bool {
         let mut inner = self.0.lock();
-        match frame {
-            Some(
-                frame @ (LoggedFrame::Settings { ack: false, .. }
-                | LoggedFrame::WindowUpdate { stream_id: 0, .. }
-                | LoggedFrame::Unknown { .. }),
-            ) => {
+        let octets = match frame {
+            Some(LoggedFrame::Settings { ack: false, params }) => Some(params.len() * 6),
+            Some(LoggedFrame::WindowUpdate { stream_id: 0, .. }) => Some(4),
+            Some(LoggedFrame::Unknown { payload, .. }) => Some(payload.len()),
+            _ => None,
+        };
+        match frame.zip(octets) {
+            Some((frame, octets))
+                if inner.frames.len() < PREFACE_FRAMES && inner.octets < PREFACE_OCTETS =>
+            {
                 inner.frames.push(frame.clone());
+                inner.octets += octets;
                 false
             }
             _ => {
