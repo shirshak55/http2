@@ -359,6 +359,14 @@ impl Control {
         self.inner.release_request(recorded);
     }
 
+    /// Tells that the request recorded as `recorded` is held before it goes out, here or on
+    /// another connection: the frames following it (see [`Self::after_request`]) don't wait
+    /// for it, but those about its stream wait for its HEADERS to go out here, or for
+    /// [`Self::release_request`].
+    pub fn hold_request(&self, recorded: u32) {
+        self.inner.hold_request(recorded);
+    }
+
     /// Whether the request recorded as `recorded` went out on this connection.
     pub fn carries(&self, recorded: u32) -> bool {
         self.inner.carries(recorded)

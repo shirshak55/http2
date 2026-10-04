@@ -118,6 +118,11 @@ struct Inner {
     /// that won't be sent on this connection (see [`Control::release_request`]), newest last
     released: VecDeque<u32>,
 
+    /// The requests, numbered so, held before they go out, which the frames following them
+    /// don't wait for, but those about their streams do (see [`Control::hold_request`]),
+    /// newest last
+    held: VecDeque<u32>,
+
     /// Whether a GOAWAY a [`Control`] queued went out: the connection's close sends none of
     /// its own then
     went_away: bool,
@@ -614,14 +619,25 @@ where
                 !evicted
             });
             me.recorded_streams.push_back((recorded, stream_id));
-            // The frames queued ahead of it (see `Control`) go out right before its HEADERS.
-            let ahead = me
-                .control
-                .iter()
-                .take_while(|queued| queued.after < recorded)
-                .count();
-            for queued in me.control.drain(..ahead).collect::<Vec<_>>() {
-                leading_frames.extend(me.control_frame(queued.frame));
+            // The frames queued ahead of it (see `Control`) go out right before its HEADERS,
+            // but those about a held request's stream, which wait for it; an acknowledgement
+            // of the peer's relayed SETTINGS applies them as it goes (see `poll_control`).
+            let mut at = 0;
+            while let Some(queued) = me.control.get(at).filter(|queued| queued.after < recorded) {
+                if me.awaits_held(&queued.frame, recorded) {
+                    at += 1;
+                    continue;
+                }
+                let queued = me.control.remove(at).expect("a frame is queued");
+                me.control_octets -= queued.frame.octets();
+                let frame = match queued.frame {
+                    ControlFrame::SettingsAck => match me.relayed_settings.pop_front() {
+                        Some(settings) => Some(frame::Leading::RelayedAck(settings)),
+                        None => me.control_frame(ControlFrame::SettingsAck),
+                    },
+                    frame => me.control_frame(frame),
+                };
+                leading_frames.extend(frame);
                 me.control_unflushed = true;
             }
         }
@@ -1206,6 +1222,7 @@ impl Control {
     /// the frames following it (see [`Queued`]) no longer wait for it.
     pub(crate) fn release_request(&self, recorded: u32) {
         let mut me = self.inner.lock();
+        me.held.retain(|held| *held != recorded);
         if me.opened_stream(recorded).is_some() {
             return;
         }
@@ -1213,6 +1230,24 @@ impl Control {
             me.released.pop_front();
         }
         me.released.push_back(recorded);
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+
+    /// Tells that the request recorded as `recorded` is held before it goes out, here or on
+    /// another connection: the frames following it (see [`Queued`]) don't wait for it, but
+    /// those about its stream do, until its HEADERS went out here or it is released (see
+    /// [`Self::release_request`]).
+    pub(crate) fn hold_request(&self, recorded: u32) {
+        let mut me = self.inner.lock();
+        if me.opened_stream(recorded).is_some() {
+            return;
+        }
+        if me.held.len() == RECORDED_STREAMS {
+            me.held.pop_front();
+        }
+        me.held.push_back(recorded);
         if let Some(task) = me.actions.task.take() {
             task.wake();
         }
@@ -1276,6 +1311,7 @@ fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
         frame::Leading::Ping(frame) => frame.into(),
         frame::Leading::Unknown(frame) => frame.into(),
         frame::Leading::GoAway(frame) => frame.into(),
+        frame::Leading::RelayedAck(_) => frame::Settings::ack().into(),
     }
 }
 
@@ -1292,12 +1328,18 @@ impl Inner {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
-        while let Some(after) = self.control.front().map(|queued| queued.after) {
-            if !self.follows(after) {
+        let mut at = 0;
+        while let Some(queued) = self.control.get(at) {
+            if !self.follows(queued.after) {
                 break;
             }
+            // One about a held request's stream waits for it, the frames after it don't.
+            if self.awaits_held(&queued.frame, 0) {
+                at += 1;
+                continue;
+            }
             ready!(dst.poll_ready(cx))?;
-            let queued = self.control.pop_front().expect("a frame is queued");
+            let queued = self.control.remove(at).expect("a frame is queued");
             self.control_octets -= queued.frame.octets();
             let acknowledges = matches!(queued.frame, ControlFrame::SettingsAck);
             if let Some(frame) = self.control_frame(queued.frame) {
@@ -1327,6 +1369,22 @@ impl Inner {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        if let Some(val) = settings.header_table_size() {
+            dst.set_send_header_table_size(val as usize);
+        }
+        if let Some(val) = settings.max_frame_size() {
+            dst.set_max_send_frame_size(val as usize);
+        }
+        self.apply_relayed_stream_settings(settings, send_buffer)
+    }
+
+    /// Applies `settings`, as [`Self::apply_relayed_settings`] does, but to the codec,
+    /// which applied them as their acknowledgement went out leading a request's HEADERS.
+    fn apply_relayed_stream_settings<B>(
+        &mut self,
+        settings: &frame::Settings,
+        send_buffer: &mut Buffer<Frame<B>>,
+    ) -> Result<(), Error> {
         self.counts.apply_remote_settings(settings, false);
         self.actions.send.apply_remote_settings(
             settings,
@@ -1335,12 +1393,6 @@ impl Inner {
             &mut self.counts,
             &mut self.actions.task,
         )?;
-        if let Some(val) = settings.header_table_size() {
-            dst.set_send_header_table_size(val as usize);
-        }
-        if let Some(val) = settings.max_frame_size() {
-            dst.set_max_send_frame_size(val as usize);
-        }
         if let Some(relay) = &self.relay {
             relay.wake_reader();
         }
@@ -1369,11 +1421,30 @@ impl Inner {
         }
     }
 
+    /// Whether `frame` is about the stream of a held request but `except` (see
+    /// [`Control::hold_request`]) whose HEADERS didn't go out here yet, so waits for it.
+    fn awaits_held(&self, frame: &ControlFrame, except: u32) -> bool {
+        let recorded = match frame {
+            ControlFrame::Unknown(_, _, stream_id, _)
+            | ControlFrame::PriorityUpdate(stream_id, _)
+            | ControlFrame::WindowUpdate(stream_id, _) => *stream_id,
+            ControlFrame::Priority(priority) => priority.stream_id().into(),
+            _ => return false,
+        };
+        recorded != 0
+            && recorded != except
+            && self.held.contains(&recorded)
+            && self
+                .opened_stream(recorded)
+                .map_or(true, |opened| opened > self.actions.send.headers_sent())
+    }
+
     /// Whether the frames following the request recorded as `after` may go out (see
     /// [`Queued::after`]).
     fn follows(&self, after: u32) -> bool {
         after == 0
             || self.released.contains(&after)
+            || self.held.contains(&after)
             || match self.opened_stream(after) {
                 Some(opened) => opened <= self.actions.send.headers_sent(),
                 None => self
@@ -1655,6 +1726,7 @@ impl Inner {
             settings_acks: 0,
             control: VecDeque::new(),
             released: VecDeque::new(),
+            held: VecDeque::new(),
             went_away: false,
             leaves_close: false,
             go_away_hook: None,
@@ -2218,14 +2290,24 @@ impl Inner {
             .recv
             .poll_complete(cx, &mut self.store, &mut self.counts, dst))?;
 
-        // Send any other pending frames
-        ready!(self.actions.send.poll_complete(
-            cx,
-            send_buffer,
-            &mut self.store,
-            &mut self.counts,
-            dst
-        ))?;
+        // Send any other pending frames, the relayed SETTINGS a request's HEADERS
+        // acknowledged applying before those after it.
+        loop {
+            ready!(self.actions.send.poll_complete(
+                cx,
+                send_buffer,
+                &mut self.store,
+                &mut self.counts,
+                dst
+            ))?;
+            let acked = self.actions.send.take_relayed_acked();
+            if acked.is_empty() {
+                break;
+            }
+            for settings in &acked {
+                self.apply_relayed_stream_settings(settings, send_buffer)?;
+            }
+        }
 
         // Those following the HEADERS that just went out.
         ready!(self.poll_control(send_buffer, cx, dst))?;

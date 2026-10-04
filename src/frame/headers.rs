@@ -52,6 +52,9 @@ pub(crate) enum Leading {
     Ping(Ping),
     Unknown(Unknown),
     GoAway(GoAway),
+    /// The acknowledgement of the peer's relayed SETTINGS frame given, which applies to the
+    /// frames after it (the HEADERS included) as it goes out.
+    RelayedAck(Settings),
 }
 
 impl Leading {
@@ -63,6 +66,7 @@ impl Leading {
             Self::Ping(frame) => frame.encode(dst),
             Self::Unknown(frame) => frame.encode(dst),
             Self::GoAway(frame) => frame.encode(dst),
+            Self::RelayedAck(_) => Settings::ack().encode(dst),
         }
     }
 }

@@ -271,10 +271,19 @@ where
             Frame::Headers(mut v) => {
                 for frame in v.take_leading() {
                     frame.encode(self.buf.get_mut());
-                    if let frame::Leading::Settings(settings) = frame {
-                        if !settings.is_ack() {
+                    match frame {
+                        frame::Leading::Settings(settings) if !settings.is_ack() => {
                             self.unacked_settings.push_back(settings);
                         }
+                        frame::Leading::RelayedAck(settings) => {
+                            if let Some(val) = settings.header_table_size() {
+                                self.hpack.update_max_size(val as usize);
+                            }
+                            if let Some(val) = settings.max_frame_size() {
+                                self.max_frame_size = val;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 let mut buf = limited_write_buf!(self);
@@ -374,6 +383,10 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                     frame::Leading::Settings(f) => LoggedFrame::Settings {
                         ack: f.is_ack(),
                         params: f.params(),
+                    },
+                    frame::Leading::RelayedAck(_) => LoggedFrame::Settings {
+                        ack: true,
+                        params: Vec::new(),
                     },
                     frame::Leading::Ping(f) => LoggedFrame::Ping {
                         ack: f.is_ack(),

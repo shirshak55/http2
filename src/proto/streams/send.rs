@@ -66,6 +66,12 @@ impl Send {
         self.prioritize.headers_sent()
     }
 
+    /// The peer's relayed SETTINGS frames the HEADERS written last acknowledged (see
+    /// `Prioritize::take_relayed_acked`).
+    pub(crate) fn take_relayed_acked(&mut self) -> Vec<frame::Settings> {
+        self.prioritize.take_relayed_acked()
+    }
+
     /// The flow-controlled octets of the DATA frames sent so far.
     pub fn data_sent(&self) -> u64 {
         self.prioritize.data_sent()

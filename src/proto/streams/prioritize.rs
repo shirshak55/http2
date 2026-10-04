@@ -68,6 +68,10 @@ pub(super) struct Prioritize {
 
     /// The flow-controlled octets of the DATA frames sent so far.
     data_sent: u64,
+
+    /// The peer's relayed SETTINGS frames a HEADERS just written acknowledged, to apply
+    /// before any frame after it goes (see `Self::take_relayed_acked`).
+    relayed_acked: Vec<frame::Settings>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -116,7 +120,14 @@ impl Prioritize {
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
             data_sent: 0,
+            relayed_acked: Vec::new(),
         }
+    }
+
+    /// The peer's relayed SETTINGS frames the HEADERS written last acknowledged (see
+    /// `frame::Leading::RelayedAck`): `poll_complete` writes nothing more until they apply.
+    pub(crate) fn take_relayed_acked(&mut self) -> Vec<frame::Settings> {
+        std::mem::take(&mut self.relayed_acked)
     }
 
     /// The newest stream whose HEADERS went out.
@@ -578,7 +589,19 @@ impl Prioritize {
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
                     }
+                    if let Frame::Headers(ref frame) = frame {
+                        self.relayed_acked
+                            .extend(frame.leading().iter().filter_map(|leading| match leading {
+                                frame::Leading::RelayedAck(settings) => Some(settings.clone()),
+                                _ => None,
+                            }));
+                    }
                     dst.buffer(frame).expect("invalid frame");
+
+                    // The SETTINGS it acknowledged apply to the frames after it.
+                    if !self.relayed_acked.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
 
                     // Ensure the codec is ready to try the loop again.
                     ready!(dst.poll_ready(cx))?;
