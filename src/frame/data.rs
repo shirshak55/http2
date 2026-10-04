@@ -113,6 +113,11 @@ impl<T> Data<T> {
         self.data
     }
 
+    /// Returns the pad length it carried, when it carried the `PADDED` flag.
+    pub(crate) fn pad_len(&self) -> Option<u8> {
+        self.pad_len
+    }
+
     /// Sets the pad length it goes with, and the `PADDED` flag when some.
     pub(crate) fn set_padding(&mut self, padding: Option<u8>) {
         self.pad_len = padding;

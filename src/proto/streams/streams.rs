@@ -23,7 +23,7 @@ use crate::{
     ext::{
         BodyLayout, FollowingFrame, FrameLog, HeaderBlockEncoding, HeaderOrder, HeadersFrame,
         HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, PrefaceFrame, Protocol,
-        ReceivedPreface, RefusePushes, SendBodyLayout,
+        ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -2396,6 +2396,12 @@ impl OpaqueStreamRef {
             .map_ok(|mut response| {
                 if let Some(sent) = stream.sent_headers.take() {
                     response.extensions_mut().insert(sent);
+                }
+                if let Some((encoding, body)) = &mut stream.received {
+                    response.extensions_mut().insert(ReceivedResponse {
+                        encoding: std::mem::take(encoding),
+                        body: body.clone(),
+                    });
                 }
                 response
             })

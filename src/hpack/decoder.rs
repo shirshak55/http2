@@ -1,4 +1,5 @@
 use super::{header::BytesStr, huffman, Header};
+use crate::ext::{FieldRepresentation, LiteralIndexing};
 use crate::{frame, tracing};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -20,6 +21,8 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    /// The dynamic table size updates decoded since [`Decoder::take_size_updates`].
+    size_updates: Vec<usize>,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -147,6 +150,7 @@ struct StringMarker {
     offset: usize,
     len: usize,
     string: Option<Bytes>,
+    huffman: bool,
 }
 
 // ===== impl Decoder =====
@@ -159,7 +163,13 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            size_updates: Vec::new(),
         }
+    }
+
+    /// The dynamic table size updates decoded since the last call, in order.
+    pub fn take_size_updates(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.size_updates)
     }
 
     /// Queues a potential size update
@@ -180,7 +190,7 @@ impl Decoder {
         mut f: F,
     ) -> Result<(), DecoderError>
     where
-        F: FnMut(Header) -> ControlFlow<()>,
+        F: FnMut(Header, FieldRepresentation) -> ControlFlow<()>,
     {
         use self::Representation::*;
 
@@ -202,43 +212,44 @@ impl Decoder {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
                     can_resize = false;
-                    let entry = self.decode_indexed(src)?;
+                    let (index, entry) = self.decode_indexed(src)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, FieldRepresentation::Indexed(index)).is_break() {
                         break;
                     }
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
                     can_resize = false;
-                    let entry = self.decode_literal(src, true)?;
+                    let (entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Incremental)?;
 
                     // Insert the header into the table
                     self.table.insert(entry.clone());
                     consume(src);
 
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let (entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Without)?;
                     consume(src);
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let (entry, representation) =
+                        self.decode_literal(src, LiteralIndexing::Never)?;
                     consume(src);
 
-                    // TODO: Track that this should never be indexed
-
-                    if f(entry).is_break() {
+                    if f(entry, representation).is_break() {
                         break;
                     }
                 }
@@ -272,21 +283,29 @@ impl Decoder {
         );
 
         self.table.set_max_size(new_size);
+        self.size_updates.push(new_size);
 
         Ok(())
     }
 
-    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+    fn decode_indexed(
+        &self,
+        buf: &mut Cursor<&mut BytesMut>,
+    ) -> Result<(usize, Header), DecoderError> {
         let index = decode_int(buf, 7)?;
-        self.table.get(index)
+        Ok((index, self.table.get(index)?))
     }
 
     fn decode_literal(
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
-        index: bool,
-    ) -> Result<Header, DecoderError> {
-        let prefix = if index { 6 } else { 4 };
+        indexing: LiteralIndexing,
+    ) -> Result<(Header, FieldRepresentation), DecoderError> {
+        let prefix = if indexing == LiteralIndexing::Incremental {
+            6
+        } else {
+            4
+        };
 
         // Extract the table index for the name, or 0 if not indexed
         let table_idx = decode_int(buf, prefix)?;
@@ -297,15 +316,30 @@ impl Decoder {
             let name_marker = self.try_decode_string(buf)?;
             let value_marker = self.try_decode_string(buf)?;
             buf.set_position(old_pos);
+            let representation = FieldRepresentation::Literal {
+                indexing,
+                name_index: None,
+                name_huffman: name_marker.huffman,
+                value_huffman: value_marker.huffman,
+            };
             // Read the name as a literal
             let name = name_marker.consume(buf);
             let value = value_marker.consume(buf);
-            Header::new(name, value)
+            Ok((Header::new(name, value)?, representation))
         } else {
             let e = self.table.get(table_idx)?;
-            let value = self.decode_string(buf)?;
+            let old_pos = buf.position();
+            let marker = self.try_decode_string(buf)?;
+            buf.set_position(old_pos);
+            let representation = FieldRepresentation::Literal {
+                indexing,
+                name_index: Some(table_idx),
+                name_huffman: false,
+                value_huffman: marker.huffman,
+            };
+            let value = marker.consume(buf);
 
-            e.name().into_entry(value)
+            Ok((e.name().into_entry(value)?, representation))
         }
     }
 
@@ -338,6 +372,7 @@ impl Decoder {
                     offset,
                     len,
                     string: Some(BytesMut::freeze(buf)),
+                    huffman: true,
                 })
             };
 
@@ -349,10 +384,12 @@ impl Decoder {
                 offset,
                 len,
                 string: None,
+                huffman: false,
             })
         }
     }
 
+    #[cfg(test)]
     fn decode_string(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<Bytes, DecoderError> {
         let old_pos = buf.position();
         let marker = self.try_decode_string(buf)?;
@@ -923,7 +960,7 @@ mod test {
     fn test_decode_empty() {
         let mut de = Decoder::new(0);
         let mut buf = BytesMut::new();
-        de.decode(&mut Cursor::new(&mut buf), |_| ControlFlow::Continue(()))
+        de.decode(&mut Cursor::new(&mut buf), |_, _| ControlFlow::Continue(()))
             .unwrap();
     }
 
@@ -938,7 +975,7 @@ mod test {
         buf.extend(huff_encode(b"bar"));
 
         let mut res = vec![];
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })
@@ -979,7 +1016,7 @@ mod test {
 
         let mut res = vec![];
         let e = de
-            .decode(&mut Cursor::new(&mut buf), |h| {
+            .decode(&mut Cursor::new(&mut buf), |h, _| {
                 res.push(h);
                 ControlFlow::Continue(())
             })
@@ -989,7 +1026,7 @@ mod test {
 
         // extend buf with the remaining header value
         buf.extend(&value[1..]);
-        de.decode(&mut Cursor::new(&mut buf), |h| {
+        de.decode(&mut Cursor::new(&mut buf), |h, _| {
             res.push(h);
             ControlFlow::Continue(())
         })

@@ -183,6 +183,79 @@ pub trait BodyLayout: Send + Sync {
     fn take_trailers(&self) -> Option<HeaderBlockEncoding>;
 }
 
+/// How a response went on the wire: its header block, and its body, kept as it arrives.
+///
+/// A client built with [`record_frames`](crate::client::Builder::record_frames) inserts
+/// one into each response.
+#[derive(Clone, Debug)]
+pub struct ReceivedResponse {
+    /// How its header block went.
+    pub encoding: HeaderBlockEncoding,
+    /// How its body goes, kept as it arrives.
+    pub body: BodyFrames,
+}
+
+/// How a message's body went on the wire past its header block, kept as it arrives:
+/// each DATA frame that carried padding or no data or ended the stream (the others
+/// carried data unpadded), and how its trailers' header block went. Clones share it.
+#[derive(Clone, Debug, Default)]
+pub struct BodyFrames(Arc<Mutex<ReceivedBody>>);
+
+#[derive(Debug, Default)]
+struct ReceivedBody {
+    /// How many DATA frames carrying data arrived.
+    data_frames: u64,
+    /// The DATA frames kept and not yet taken.
+    frames: std::collections::VecDeque<DataFrame>,
+    trailers: Option<HeaderBlockEncoding>,
+}
+
+/// The most DATA frames a [`BodyFrames`] holds untaken; it drops any more.
+const MAX_KEPT_DATA_FRAMES: usize = 1024;
+
+impl BodyFrames {
+    fn lock(&self) -> MutexGuard<'_, ReceivedBody> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn push_data(&self, len: usize, padding: Option<u8>, end_stream: bool) {
+        let mut body = self.lock();
+        let index = body.data_frames;
+        if len > 0 {
+            body.data_frames += 1;
+        }
+        if (padding.is_some() || len == 0 || end_stream) && body.frames.len() < MAX_KEPT_DATA_FRAMES
+        {
+            body.frames.push_back(DataFrame {
+                index,
+                len,
+                padding,
+                end_stream,
+            });
+        }
+    }
+
+    pub(crate) fn set_trailers(&self, encoding: HeaderBlockEncoding) {
+        self.lock().trailers = Some(encoding);
+    }
+
+    /// Removes and returns the DATA frames kept so far that went no later than the DATA
+    /// frame carrying data at `through`, or every one kept given `None`.
+    pub fn take(&self, through: Option<u64>) -> Vec<DataFrame> {
+        let mut body = self.lock();
+        let end = match through {
+            Some(through) => body.frames.partition_point(|frame| frame.index <= through),
+            None => body.frames.len(),
+        };
+        body.frames.drain(..end).collect()
+    }
+
+    /// Takes how the trailers' header block went, once it arrived.
+    pub fn take_trailers(&self) -> Option<HeaderBlockEncoding> {
+        self.lock().trailers.take()
+    }
+}
+
 /// A request extension sending its body as a [`BodyLayout`] says.
 #[derive(Clone)]
 pub struct SendBodyLayout(pub Arc<dyn BodyLayout>);

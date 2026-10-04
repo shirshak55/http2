@@ -355,6 +355,10 @@ fn decode_frame(
                 }
             }
 
+            if let Continuable::Headers(headers) = &mut partial.frame {
+                headers.push_fragment(bytes.len() - frame::HEADER_LEN);
+            }
+
             // Extend the buf
             if partial.buf.is_empty() {
                 partial.buf = bytes.split_off(frame::HEADER_LEN);

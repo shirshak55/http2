@@ -1,4 +1,4 @@
-use crate::ext::{BodyLayout, HeadersFrame};
+use crate::ext::{BodyFrames, BodyLayout, HeaderBlockEncoding, HeadersFrame};
 use crate::{tracing, Reason};
 
 use super::*;
@@ -134,6 +134,9 @@ pub(super) struct Stream {
     /// How the request's HEADERS frame was sent, when recording frames
     pub sent_headers: Option<HeadersFrame>,
 
+    /// How the response's header block and body went, when recording frames
+    pub received: Option<(HeaderBlockEncoding, BodyFrames)>,
+
     /// How many of the frames queued right after its HEADERS (see
     /// [`FollowingFrame`](crate::ext::FollowingFrame)) are still to go out, right after it
     pub following: usize,
@@ -222,6 +225,7 @@ impl Stream {
             body_chunks: 0,
             content_length: ContentLength::Omitted,
             sent_headers: None,
+            received: None,
             following: 0,
         }
     }

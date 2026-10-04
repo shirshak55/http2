@@ -1,7 +1,7 @@
 use super::{
     util, GoAway, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate,
 };
-use crate::ext::{HeaderBlockEncoding, HeaderOrder, Protocol, PseudoHeader};
+use crate::ext::{EncodedField, HeaderBlockEncoding, HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 use crate::tracing;
@@ -246,6 +246,9 @@ struct HeaderBlock {
     /// How to encode it, when it goes as a recorded block went (see
     /// [`HeaderBlockEncoding`])
     encoding: Option<Box<HeaderBlockEncoding>>,
+
+    /// How the block went on the wire, as decoded
+    received: HeaderBlockEncoding,
 }
 
 // Frames compare by their fields, as a `HeaderMap` does, whatever order they came in.
@@ -289,6 +292,7 @@ impl Headers {
                 order: HeaderOrder::default(),
                 is_over_size: false,
                 encoding: None,
+                received: HeaderBlockEncoding::default(),
                 pseudo,
             },
             flags: HeadersFlag::default(),
@@ -309,6 +313,7 @@ impl Headers {
                 order: HeaderOrder::default(),
                 is_over_size: false,
                 encoding: None,
+                received: HeaderBlockEncoding::default(),
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -377,6 +382,11 @@ impl Headers {
                 field_size: 0,
                 is_over_size: false,
                 encoding: None,
+                received: HeaderBlockEncoding {
+                    padding: flags.is_padded().then_some(pad as u8),
+                    fragments: vec![src.len()],
+                    ..HeaderBlockEncoding::default()
+                },
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -441,6 +451,16 @@ impl Headers {
     /// Encodes the block, and lays it out in frames, as `encoding` says.
     pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
         self.header_block.encoding = Some(Box::new(encoding));
+    }
+
+    /// Notes a CONTINUATION frame's fragment of `len` octets of the block.
+    pub(crate) fn push_fragment(&mut self, len: usize) {
+        self.header_block.received.fragments.push(len);
+    }
+
+    /// Takes how the block went on the wire, as decoded.
+    pub(crate) fn take_received_encoding(&mut self) -> HeaderBlockEncoding {
+        std::mem::take(&mut self.header_block.received)
     }
 
     #[cfg(feature = "unstable")]
@@ -609,6 +629,7 @@ impl PushPromise {
                 order: HeaderOrder::default(),
                 is_over_size: false,
                 encoding: None,
+                received: HeaderBlockEncoding::default(),
                 pseudo,
             },
             promised_id,
@@ -702,6 +723,7 @@ impl PushPromise {
                 field_size: 0,
                 is_over_size: false,
                 encoding: None,
+                received: HeaderBlockEncoding::default(),
                 pseudo: Pseudo::default(),
             },
             promised_id,
@@ -1188,8 +1210,16 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode(&mut cursor, |header, representation| {
             use crate::hpack::Header::*;
+
+            if !self.is_over_size {
+                self.received.fields.push(EncodedField {
+                    name: Bytes::copy_from_slice(header.name().as_slice()),
+                    value: Bytes::copy_from_slice(header.value_slice()),
+                    representation,
+                });
+            }
 
             match header {
                 Field { name, value } => {
@@ -1241,6 +1271,10 @@ impl HeaderBlock {
 
             ControlFlow::Continue(())
         });
+
+        self.received
+            .size_updates
+            .extend(decoder.take_size_updates());
 
         match res {
             Ok(()) => {}

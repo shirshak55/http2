@@ -253,6 +253,12 @@ impl Recv {
 
         let stream_id = frame.stream_id();
         let order = frame.take_header_order();
+        if stream.sent_headers.is_some() && !frame.pseudo().is_informational() {
+            stream.received = Some((
+                frame.take_received_encoding(),
+                crate::ext::BodyFrames::default(),
+            ));
+        }
         let (pseudo, fields) = frame.into_parts();
 
         if pseudo.protocol.is_some()
@@ -443,6 +449,9 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        if let Some((_, body)) = &stream.received {
+            body.set_trailers(frame.take_received_encoding());
+        }
         let order = frame.take_header_order();
         let trailers = frame.into_fields();
 
@@ -729,6 +738,14 @@ impl Recv {
             // stream or connection error. We've opted to send a stream
             // error.
             return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
+        }
+
+        if let Some((_, body)) = &stream.received {
+            body.push_data(
+                frame.payload().len(),
+                frame.pad_len(),
+                frame.is_end_stream(),
+            );
         }
 
         // use payload len, padding doesn't count for content-length
