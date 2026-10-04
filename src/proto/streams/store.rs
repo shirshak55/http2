@@ -103,6 +103,11 @@ impl Store {
         })
     }
 
+    /// Whether the stream `id` is open, or still sending, here.
+    pub fn contains(&self, id: &StreamId) -> bool {
+        self.ids.contains_key(id)
+    }
+
     pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr<'_> {
         let index = SlabIndex(self.slab.insert(val) as u32);
         assert!(self.ids.insert(id, index).is_none());

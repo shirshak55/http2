@@ -158,7 +158,8 @@ struct Inner {
 const PRIORITY_UPDATE: u8 = 0x10;
 
 /// How many of the streams opened for requests carrying their recorded stream id are
-/// kept, to renumber the dependencies of the requests after them.
+/// kept, to renumber the dependencies of the requests after them: those still open are
+/// kept past it.
 const RECORDED_STREAMS: usize = 256;
 
 #[derive(Debug)]
@@ -525,9 +526,14 @@ where
             })
             .collect();
         if let Some(recorded) = recorded {
-            if me.recorded_streams.len() == RECORDED_STREAMS {
-                me.recorded_streams.pop_front();
-            }
+            // Only closed streams' entries go, oldest first: an open one's frames need its.
+            let mut excess = (me.recorded_streams.len() + 1).saturating_sub(RECORDED_STREAMS);
+            let store = &me.store;
+            me.recorded_streams.retain(|(_, opened)| {
+                let evicted = excess > 0 && !store.contains(opened);
+                excess -= usize::from(evicted);
+                !evicted
+            });
             me.recorded_streams.push_back((recorded, stream_id));
             // The frames queued ahead of it (see `Control`) go out right before its HEADERS.
             let ahead = me
