@@ -426,8 +426,7 @@ fn decode_frame(
             }
             // Handed over for a caller relaying them (see `Control::relay_received`).
             return Ok(Some(
-                frame::Unknown::new(bytes[3], head.flag(), head.stream_id().into(), payload)
-                    .into(),
+                frame::Unknown::new(bytes[3], head.flag(), head.stream_id().into(), payload).into(),
             ));
         }
     };

@@ -1,5 +1,6 @@
 use super::table::{index_static, Index, Table};
 use super::{huffman, Header};
+use crate::ext::{FieldRepresentation, HeaderBlockEncoding, LiteralIndexing};
 use crate::tracing;
 
 use bytes::{BufMut, BytesMut};
@@ -9,6 +10,8 @@ use http::header::{HeaderName, HeaderValue};
 pub struct Encoder {
     table: Table,
     size_update: Option<SizeUpdate>,
+    /// The largest table the peer allows.
+    max_allowed: usize,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -22,6 +25,7 @@ impl Encoder {
         Encoder {
             table: Table::new(max_size, capacity),
             size_update: None,
+            max_allowed: max_size,
         }
     }
 
@@ -29,6 +33,7 @@ impl Encoder {
     ///
     /// The next call to `encode` will include a dynamic size update frame.
     pub fn update_max_size(&mut self, val: usize) {
+        self.max_allowed = val;
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
                 if val > old {
@@ -102,6 +107,147 @@ impl Encoder {
                     );
                 }
             }
+        }
+    }
+
+    /// Encodes `headers` as `encoding` says (see [`HeaderBlockEncoding`]); a pseudo-header
+    /// marked `true` goes as a never-indexed literal, as a field whose value is sensitive
+    /// does.
+    pub fn encode_as<I>(&mut self, headers: I, encoding: &HeaderBlockEncoding, dst: &mut BytesMut)
+    where
+        I: IntoIterator<Item = (Header<Option<HeaderName>>, bool)>,
+    {
+        self.encode_size_updates_as(&encoding.size_updates, dst);
+
+        let mut taken = vec![false; encoding.fields.len()];
+        let mut last_name = None;
+        for (header, never_indexed) in headers {
+            let header = match header.reify() {
+                Ok(header) => {
+                    if let Header::Field { name, .. } = &header {
+                        last_name = Some(name.clone());
+                    }
+                    header
+                }
+                Err(value) => Header::Field {
+                    name: last_name
+                        .clone()
+                        .expect("encoding header without name, but no previous name"),
+                    value,
+                },
+            };
+            let name = header.name();
+            let recorded = (0..encoding.fields.len())
+                .find(|&at| {
+                    !taken[at]
+                        && encoding.fields[at].name == name.as_slice()
+                        && encoding.fields[at].value == header.value_slice()
+                })
+                .or_else(|| {
+                    (0..encoding.fields.len())
+                        .find(|&at| !taken[at] && encoding.fields[at].name == name.as_slice())
+                });
+            match recorded {
+                Some(at) => {
+                    taken[at] = true;
+                    let representation = encoding.fields[at].representation;
+                    self.encode_header_as(header, representation, never_indexed, dst);
+                }
+                None if never_indexed => {
+                    let value = header.value_slice();
+                    match index_static(&header) {
+                        Some((idx, _)) => encode_not_indexed(idx, value, true, dst),
+                        None => encode_not_indexed2(header.name().as_slice(), value, true, dst),
+                    }
+                }
+                None => {
+                    let index = self.table.index(header);
+                    self.encode_header(&index, dst);
+                }
+            }
+        }
+    }
+
+    /// Encodes `header` as `representation`, as far as the table allows: an entry the table
+    /// doesn't hold at the index named is named by its index of it, if any, and a field it
+    /// doesn't hold at all goes as a literal entering it. A never-indexed one stays so.
+    fn encode_header_as(
+        &mut self,
+        header: Header,
+        representation: FieldRepresentation,
+        never_indexed: bool,
+        dst: &mut BytesMut,
+    ) {
+        let never = never_indexed || header.is_sensitive();
+        let (indexing, name_index, name_huffman, value_huffman) = match representation {
+            FieldRepresentation::Indexed(index) => {
+                if !never {
+                    if let Some(index) = self.table.find(&header, index) {
+                        encode_int(index, 7, 0x80, dst);
+                        return;
+                    }
+                }
+                let name_index = self.table.find_name(&header, None);
+                (LiteralIndexing::Incremental, name_index, true, true)
+            }
+            FieldRepresentation::Literal {
+                indexing,
+                name_index,
+                name_huffman,
+                value_huffman,
+            } => {
+                let name_index =
+                    name_index.and_then(|index| self.table.find_name(&header, Some(index)));
+                (indexing, name_index, name_huffman, value_huffman)
+            }
+        };
+        let indexing = if never {
+            LiteralIndexing::Never
+        } else {
+            indexing
+        };
+        let (prefix, first_byte) = match indexing {
+            LiteralIndexing::Incremental => (6, 0b0100_0000),
+            LiteralIndexing::Without => (4, 0),
+            LiteralIndexing::Never => (4, 0b0001_0000),
+        };
+        match name_index {
+            Some(index) => encode_int(index, prefix, first_byte, dst),
+            None => {
+                dst.put_u8(first_byte);
+                encode_str_as(header.name().as_slice(), name_huffman, dst);
+            }
+        }
+        encode_str_as(header.value_slice(), value_huffman, dst);
+        if indexing == LiteralIndexing::Incremental {
+            self.table.insert_entry(header);
+        }
+    }
+
+    /// Encodes the size updates `recorded` lists, when the peer allows them, in place of
+    /// those queued unless one of those lowers the table further; and those queued
+    /// otherwise, or when they lower it (an increase the encoder needn't take).
+    fn encode_size_updates_as(&mut self, recorded: &[usize], dst: &mut BytesMut) {
+        let lowest_queued = match self.size_update {
+            Some(SizeUpdate::One(val)) => Some(val),
+            Some(SizeUpdate::Two(min, _)) => Some(min),
+            None => None,
+        };
+        let must_lower = lowest_queued.filter(|&lowest| lowest < self.table.max_size());
+        if recorded.iter().any(|&size| size > self.max_allowed) {
+            self.encode_size_updates(dst);
+            return;
+        }
+        let lowest_recorded = recorded.iter().copied().min();
+        match must_lower {
+            Some(lowest) if lowest_recorded.map_or(true, |recorded| recorded > lowest) => {
+                self.encode_size_updates(dst);
+            }
+            _ => self.size_update = None,
+        }
+        for &size in recorded {
+            self.table.resize(size);
+            encode_size_update(size, dst);
         }
     }
 
@@ -220,6 +366,16 @@ fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut Byt
 
     encode_str(name, dst);
     encode_str(value, dst);
+}
+
+/// Encodes `val` Huffman-coded or as is.
+fn encode_str_as(val: &[u8], huffman: bool, dst: &mut BytesMut) {
+    if huffman && !val.is_empty() {
+        encode_str(val, dst);
+    } else {
+        encode_int(val.len(), 7, if huffman { 0x80 } else { 0 }, dst);
+        dst.put_slice(val);
+    }
 }
 
 fn encode_str(val: &[u8], dst: &mut BytesMut) {

@@ -1,7 +1,7 @@
 use super::{
     util, GoAway, Ping, Priority, Settings, StreamDependency, StreamId, Unknown, WindowUpdate,
 };
-use crate::ext::{HeaderOrder, Protocol, PseudoHeader};
+use crate::ext::{HeaderBlockEncoding, HeaderOrder, Protocol, PseudoHeader};
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 use crate::tracing;
@@ -12,7 +12,7 @@ use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::Cursor;
 use std::ops::ControlFlow;
@@ -242,6 +242,10 @@ struct HeaderBlock {
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    /// How to encode it, when it goes as a recorded block went (see
+    /// [`HeaderBlockEncoding`])
+    encoding: Option<Box<HeaderBlockEncoding>>,
 }
 
 // Frames compare by their fields, as a `HeaderMap` does, whatever order they came in.
@@ -259,6 +263,10 @@ impl Eq for HeaderBlock {}
 #[derive(Debug)]
 struct EncodingHeaderBlock {
     hpack: Bytes,
+    /// The HEADERS frame's pad length, to pad it with.
+    padding: Option<u8>,
+    /// The lengths of the fragments still to send, the room in each frame aside.
+    fragments: VecDeque<usize>,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -280,6 +288,7 @@ impl Headers {
                 fields,
                 order: HeaderOrder::default(),
                 is_over_size: false,
+                encoding: None,
                 pseudo,
             },
             flags: HeadersFlag::default(),
@@ -299,6 +308,7 @@ impl Headers {
                 fields,
                 order: HeaderOrder::default(),
                 is_over_size: false,
+                encoding: None,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -366,6 +376,7 @@ impl Headers {
                 order: HeaderOrder::default(),
                 field_size: 0,
                 is_over_size: false,
+                encoding: None,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -425,6 +436,11 @@ impl Headers {
     /// Encodes the pseudo-header fields `never_indexed` lists as never-indexed literals.
     pub(crate) fn set_never_indexed(&mut self, never_indexed: Vec<PseudoId>) {
         self.header_block.pseudo.never_indexed = never_indexed;
+    }
+
+    /// Encodes the block, and lays it out in frames, as `encoding` says.
+    pub(crate) fn set_encoding(&mut self, encoding: HeaderBlockEncoding) {
+        self.header_block.encoding = Some(Box::new(encoding));
     }
 
     #[cfg(feature = "unstable")]
@@ -500,14 +516,14 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(head, dst, |dst| {
-                if let Some(ref stream_dep) = self.stream_dep {
-                    // write 5 bytes for the stream dependency
-                    stream_dep.encode(dst);
-                }
-            })
+        let mut encoding = self.header_block.into_encoding(encoder);
+        let padding = encoding.padding.take();
+        encoding.encode(head, dst, padding, |dst| {
+            if let Some(ref stream_dep) = self.stream_dep {
+                // write 5 bytes for the stream dependency
+                stream_dep.encode(dst);
+            }
+        })
     }
 
     fn head(&self) -> Head {
@@ -592,6 +608,7 @@ impl PushPromise {
                 fields,
                 order: HeaderOrder::default(),
                 is_over_size: false,
+                encoding: None,
                 pseudo,
             },
             promised_id,
@@ -684,6 +701,7 @@ impl PushPromise {
                 order: HeaderOrder::default(),
                 field_size: 0,
                 is_over_size: false,
+                encoding: None,
                 pseudo: Pseudo::default(),
             },
             promised_id,
@@ -734,7 +752,7 @@ impl PushPromise {
 
         self.header_block
             .into_encoding(encoder)
-            .encode(head, dst, |dst| {
+            .encode(head, dst, None, |dst| {
                 dst.put_u32(promised_id.into());
             })
     }
@@ -777,7 +795,7 @@ impl Continuation {
         // Get the CONTINUATION frame head
         let head = self.head();
 
-        self.header_block.encode(head, dst, |_| {})
+        self.header_block.encode(head, dst, None, |_| {})
     }
 }
 
@@ -881,7 +899,15 @@ impl Pseudo {
 // ===== impl EncodingHeaderBlock =====
 
 impl EncodingHeaderBlock {
-    fn encode<F>(mut self, head: Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    /// Encodes a frame of `head` carrying the next fragment, padded by `padding` when the
+    /// frame has room for it, `f` writing what comes before the fragment.
+    fn encode<F>(
+        mut self,
+        head: Head,
+        dst: &mut EncodeBuf<'_>,
+        padding: Option<u8>,
+        f: F,
+    ) -> Option<Continuation>
     where
         F: FnOnce(&mut EncodeBuf<'_>),
     {
@@ -894,11 +920,21 @@ impl EncodingHeaderBlock {
 
         let payload_pos = dst.get_ref().len();
 
+        // Its length, ahead of the priority fields, which take at most 5 octets.
+        let padding = padding.filter(|&pad| usize::from(pad) + 6 <= dst.remaining_mut());
+        if let Some(pad) = padding {
+            dst.put_u8(pad);
+            dst.get_mut()[head_pos + 4] |= PADDED;
+        }
+        let pad = padding.map_or(0, usize::from);
+
         f(dst);
 
         // Now, encode the header payload
-        let continuation = if self.hpack.len() > dst.remaining_mut() {
-            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+        let room = dst.remaining_mut() - pad;
+        let len = self.fragments.pop_front().map_or(room, |len| len.min(room));
+        let continuation = if self.hpack.len() > len {
+            dst.put((&mut self.hpack).take(len));
 
             Some(Continuation {
                 stream_id: head.stream_id(),
@@ -909,6 +945,7 @@ impl EncodingHeaderBlock {
 
             None
         };
+        dst.put_bytes(0, pad);
 
         // Compute the header block length
         let payload_len = (dst.get_ref().len() - payload_pos) as u64;
@@ -1249,10 +1286,23 @@ impl HeaderBlock {
         }
         .chain(ordered);
 
-        encoder.encode(headers, &mut hpack);
-
-        EncodingHeaderBlock {
-            hpack: hpack.freeze(),
+        match self.encoding {
+            Some(encoding) => {
+                encoder.encode_as(headers, &encoding, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack: hpack.freeze(),
+                    padding: encoding.padding,
+                    fragments: encoding.fragments.into(),
+                }
+            }
+            None => {
+                encoder.encode(headers, &mut hpack);
+                EncodingHeaderBlock {
+                    hpack: hpack.freeze(),
+                    padding: None,
+                    fragments: VecDeque::new(),
+                }
+            }
         }
     }
 

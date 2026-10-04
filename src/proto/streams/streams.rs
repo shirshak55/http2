@@ -20,8 +20,9 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        FollowingFrame, FrameLog, HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame,
-        NeverIndexedPseudo, PrefaceFrame, Protocol, ReceivedPreface, RefusePushes,
+        FollowingFrame, FrameLog, HeaderBlockEncoding, HeaderOrder, HeadersFrame,
+        HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, PrefaceFrame, Protocol,
+        ReceivedPreface, RefusePushes,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -354,6 +355,7 @@ where
         let protocol = request.extensions_mut().remove::<Protocol>();
         let order = request.extensions_mut().remove::<HeaderOrder>();
         let never_indexed = request.extensions_mut().remove::<NeverIndexedPseudo>();
+        let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
         let refuse_pushes = request.extensions_mut().remove::<RefusePushes>().is_some();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
@@ -573,6 +575,9 @@ where
         )?;
         if let Some(NeverIndexedPseudo(never_indexed)) = never_indexed {
             headers.set_never_indexed(never_indexed);
+        }
+        if let Some(encoding) = encoding {
+            headers.set_encoding(encoding);
         }
 
         let following = following

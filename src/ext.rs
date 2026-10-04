@@ -86,6 +86,71 @@ pub struct RefusePushes;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NeverIndexedPseudo(pub Vec<PseudoId>);
 
+/// How a header block goes on the wire: its HPACK dynamic table size updates and each
+/// field's representation (RFC 7541), and how its HEADERS frame and the CONTINUATION
+/// frames after it carry it.
+///
+/// A request sent with one has its header block encoded as it says, as far as the
+/// connection's own table allows: each field takes the representation of the first field
+/// it lists by that name and value not taken yet, else by that name, and a representation
+/// naming a table entry the connection's table doesn't hold at that index names one that
+/// does, or goes as a literal entering the table; fields it doesn't list, and size updates
+/// above the peer's limit, go as the connection would send them. The HEADERS frame takes
+/// its padding, and the fragments their lengths, as far as the block and the peer's frame
+/// size allow.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HeaderBlockEncoding {
+    /// The dynamic table size updates at its start, in order (RFC 7541 §6.3).
+    pub size_updates: Vec<usize>,
+    /// Its fields in block order, pseudo-header fields first.
+    pub fields: Vec<EncodedField>,
+    /// The HEADERS frame's pad length, when it carried the PADDED flag.
+    pub padding: Option<u8>,
+    /// The lengths of the block's fragments: the HEADERS frame's, then each
+    /// CONTINUATION frame's.
+    pub fragments: Vec<usize>,
+}
+
+/// A header field as a header block carried it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EncodedField {
+    /// Its name, a pseudo-header field's with its colon.
+    pub name: Bytes,
+    /// Its value.
+    pub value: Bytes,
+    /// How it went.
+    pub representation: FieldRepresentation,
+}
+
+/// How a header field went in an HPACK header block (RFC 7541 §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldRepresentation {
+    /// By the index of its static or dynamic table entry (§6.1).
+    Indexed(usize),
+    /// As a literal (§6.2).
+    Literal {
+        /// Whether, and how, it enters the dynamic table.
+        indexing: LiteralIndexing,
+        /// The index of the table entry naming it, or `None` for a literal name.
+        name_index: Option<usize>,
+        /// Whether its literal name is Huffman-coded.
+        name_huffman: bool,
+        /// Whether its value is Huffman-coded.
+        value_huffman: bool,
+    },
+}
+
+/// How a literal header field touches the HPACK dynamic table (RFC 7541 §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LiteralIndexing {
+    /// It enters the table (§6.2.1).
+    Incremental,
+    /// It doesn't (§6.2.2).
+    Without,
+    /// It doesn't, nor may an intermediary encoding it again add it (§6.2.3).
+    Never,
+}
+
 /// How to send the HEADERS frame of the request carrying it, in place of the connection's
 /// [`headers_pseudo_order`] and [`headers_stream_dependency`].
 ///
