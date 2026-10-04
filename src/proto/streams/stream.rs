@@ -128,6 +128,9 @@ pub(super) struct Stream {
     /// out
     pub body_chunks: u64,
 
+    /// The DATA frames `body_layout` told of that its body didn't reach yet
+    pub body_frames: std::collections::VecDeque<crate::ext::DataFrame>,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -223,6 +226,7 @@ impl Stream {
             cancel_reason: None,
             body_layout: None,
             body_chunks: 0,
+            body_frames: std::collections::VecDeque::new(),
             content_length: ContentLength::Omitted,
             sent_headers: None,
             received: None,
