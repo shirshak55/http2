@@ -1,6 +1,7 @@
 use crate::frame::{util, Error, Frame, Head, Kind, StreamId};
 use bytes::{Buf, BufMut, Bytes};
 
+use std::collections::VecDeque;
 use std::fmt;
 
 /// Data frame
@@ -14,6 +15,18 @@ pub struct Data<T = Bytes> {
     data: T,
     flags: DataFlags,
     pad_len: Option<u8>,
+    /// The frames it goes as, when not as one carrying it unpadded (see
+    /// `ext::SendBodyLayout`).
+    plan: VecDeque<PlannedFrame>,
+}
+
+/// A frame a DATA frame's data goes in (see `Data::plan_mut`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedFrame {
+    /// Whether it carries the data, or goes empty ahead of or after it.
+    pub data: bool,
+    /// Its pad length, when padded.
+    pub padding: Option<u8>,
 }
 
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
@@ -33,6 +46,7 @@ impl<T> Data<T> {
             data: payload,
             flags: DataFlags::default(),
             pad_len: None,
+            plan: VecDeque::new(),
         }
     }
 
@@ -99,6 +113,31 @@ impl<T> Data<T> {
         self.data
     }
 
+    /// Sets the pad length it goes with, and the `PADDED` flag when some.
+    pub(crate) fn set_padding(&mut self, padding: Option<u8>) {
+        self.pad_len = padding;
+        self.flags.0 = (self.flags.0 & !PADDED) | padding.map_or(0, |_| PADDED);
+    }
+
+    /// The bytes its padding takes beyond its data, the pad length field included.
+    pub(crate) fn padding_len(&self) -> usize {
+        self.pad_len.map_or(0, |pad_len| usize::from(pad_len) + 1)
+    }
+
+    /// The frames it goes as, in order; when empty, as one carrying it unpadded.
+    pub(crate) fn plan_mut(&mut self) -> &mut VecDeque<PlannedFrame> {
+        &mut self.plan
+    }
+
+    /// The bytes the padding of the frames it goes as takes beyond its data.
+    pub(crate) fn planned_padding_len(&self) -> usize {
+        self.plan
+            .iter()
+            .filter_map(|frame| frame.padding)
+            .map(|pad_len| usize::from(pad_len) + 1)
+            .sum()
+    }
+
     pub(crate) fn head(&self) -> Head {
         Head::new(Kind::Data, self.flags.into(), self.stream_id)
     }
@@ -112,6 +151,7 @@ impl<T> Data<T> {
             data: f(self.data),
             flags: self.flags,
             pad_len: self.pad_len,
+            plan: self.plan,
         }
     }
 }
@@ -137,6 +177,7 @@ impl Data<Bytes> {
             data: payload,
             flags,
             pad_len,
+            plan: VecDeque::new(),
         })
     }
 
@@ -161,6 +202,7 @@ mod tests {
             data: Bytes::copy_from_slice(data),
             flags: DataFlags::default(),
             pad_len,
+            plan: VecDeque::new(),
         }
     }
 
@@ -200,11 +242,18 @@ impl<T: Buf> Data<T> {
     /// Panics if `dst` cannot contain the data frame.
     pub(crate) fn encode_chunk<U: BufMut>(&mut self, dst: &mut U) {
         let len = self.data.remaining();
+        let padding_len = self.padding_len();
 
-        assert!(dst.remaining_mut() >= len);
+        assert!(dst.remaining_mut() >= len + padding_len);
 
-        self.head().encode(len, dst);
+        self.head().encode(len + padding_len, dst);
+        if let Some(pad_len) = self.pad_len {
+            dst.put_u8(pad_len);
+        }
         dst.put(&mut self.data);
+        if let Some(pad_len) = self.pad_len {
+            dst.put_bytes(0, pad_len.into());
+        }
     }
 }
 

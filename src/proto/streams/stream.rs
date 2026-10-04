@@ -1,4 +1,4 @@
-use crate::ext::HeadersFrame;
+use crate::ext::{BodyLayout, HeadersFrame};
 use crate::{tracing, Reason};
 
 use super::*;
@@ -120,6 +120,14 @@ pub(super) struct Stream {
     /// it, in their own's stead (see `Control::cancel_with`)
     pub cancel_reason: Option<Reason>,
 
+    /// How its body goes, when as another connection received one (see
+    /// `ext::SendBodyLayout`)
+    pub body_layout: Option<std::sync::Arc<dyn BodyLayout>>,
+
+    /// How many chunks carrying data its body went in so far, when `body_layout` lays it
+    /// out
+    pub body_chunks: u64,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -210,6 +218,8 @@ impl Stream {
             pending_push_promises: store::Queue::new(),
             refuse_pushes: false,
             cancel_reason: None,
+            body_layout: None,
+            body_chunks: 0,
             content_length: ContentLength::Omitted,
             sent_headers: None,
             following: 0,

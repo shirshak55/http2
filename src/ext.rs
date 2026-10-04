@@ -151,6 +151,48 @@ pub enum LiteralIndexing {
     Never,
 }
 
+/// A DATA frame a [`BodyLayout`] holds: one of a body another connection received that
+/// carried padding or no data or ended the stream (the others carried data unpadded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DataFrame {
+    /// How many DATA frames carrying data went before it on its stream.
+    pub index: u64,
+    /// The length of its data.
+    pub len: usize,
+    /// Its pad length, when it carried the PADDED flag.
+    pub padding: Option<u8>,
+    /// The END_STREAM flag.
+    pub end_stream: bool,
+}
+
+/// How a body goes on the wire past its header block, as another connection received
+/// it: its DATA frames that carried padding or no data or ended the stream, and how its
+/// trailers' header block went.
+///
+/// A request sent with a [`SendBodyLayout`] goes so: ahead of each chunk of its body go
+/// the empty DATA frames the layout has there, the chunk takes its frame's padding when
+/// their lengths match, and its end goes in a frame of its own when the layout's did, as
+/// far as the peer's frame size and flow control allow a padded frame whole. Its
+/// trailers' header block goes as [`HeaderBlockEncoding`] says.
+pub trait BodyLayout: Send + Sync {
+    /// Removes and returns the DATA frames it holds that went no later than the DATA
+    /// frame carrying data at `through`, or every one given `None`.
+    fn take(&self, through: Option<u64>) -> Vec<DataFrame>;
+
+    /// Takes how the trailers' header block went, once it arrived.
+    fn take_trailers(&self) -> Option<HeaderBlockEncoding>;
+}
+
+/// A request extension sending its body as a [`BodyLayout`] says.
+#[derive(Clone)]
+pub struct SendBodyLayout(pub Arc<dyn BodyLayout>);
+
+impl fmt::Debug for SendBodyLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("SendBodyLayout(..)")
+    }
+}
+
 /// How to send the HEADERS frame of the request carrying it, in place of the connection's
 /// [`headers_pseudo_order`] and [`headers_stream_dependency`].
 ///

@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::VecDeque,
     fmt, io,
     sync::Arc,
@@ -20,9 +21,9 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        FollowingFrame, FrameLog, HeaderBlockEncoding, HeaderOrder, HeadersFrame,
+        BodyLayout, FollowingFrame, FrameLog, HeaderBlockEncoding, HeaderOrder, HeadersFrame,
         HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, PrefaceFrame, Protocol,
-        ReceivedPreface, RefusePushes,
+        ReceivedPreface, RefusePushes, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -356,6 +357,7 @@ where
         let order = request.extensions_mut().remove::<HeaderOrder>();
         let never_indexed = request.extensions_mut().remove::<NeverIndexedPseudo>();
         let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
+        let body_layout = request.extensions_mut().remove::<SendBodyLayout>();
         let refuse_pushes = request.extensions_mut().remove::<RefusePushes>().is_some();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
@@ -428,6 +430,7 @@ where
             .recv_flow
             .set_threshold(me.actions.recv.stream_threshold());
         stream.refuse_pushes = refuse_pushes;
+        stream.body_layout = body_layout.map(|layout| layout.0);
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -2036,6 +2039,47 @@ where
 
 // ===== impl StreamRef =====
 
+/// The frames a body's chunk of `len` bytes goes as, after `index` chunks carrying data,
+/// as `layout` says (see [`SendBodyLayout`]); empty for one frame carrying it unpadded.
+fn plan_data(
+    layout: &dyn BodyLayout,
+    index: u64,
+    len: usize,
+    end_stream: bool,
+) -> VecDeque<frame::PlannedFrame> {
+    let empty = |padding| frame::PlannedFrame {
+        data: false,
+        padding,
+    };
+    let mut before = VecDeque::new();
+    let mut padding = None;
+    let mut after = Vec::new();
+    for received in layout.take((!end_stream).then_some(index)) {
+        match (received.len, received.index.cmp(&index)) {
+            (0, cmp::Ordering::Equal) if len == 0 && received.end_stream => {
+                padding = received.padding
+            }
+            (0, cmp::Ordering::Equal) if !received.end_stream => {
+                before.push_back(empty(received.padding))
+            }
+            (0, cmp::Ordering::Greater) if len > 0 => after.push(empty(received.padding)),
+            (received_len, cmp::Ordering::Equal) if received_len == len && len > 0 => {
+                padding = received.padding
+            }
+            _ => {}
+        }
+    }
+    if before.is_empty() && padding.is_none() && after.is_empty() {
+        return before;
+    }
+    before.push_back(frame::PlannedFrame {
+        data: true,
+        padding,
+    });
+    before.extend(after);
+    before
+}
+
 impl<B> StreamRef<B> {
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
@@ -2053,6 +2097,13 @@ impl<B> StreamRef<B> {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
+            if let Some(layout) = &stream.body_layout {
+                let len = frame.payload().remaining();
+                *frame.plan_mut() = plan_data(&**layout, stream.body_chunks, len, end_stream);
+                if len > 0 {
+                    stream.body_chunks += 1;
+                }
+            }
 
             // Send the data frame
             actions
@@ -2078,6 +2129,13 @@ impl<B> StreamRef<B> {
             // Create the trailers frame
             let mut frame = frame::Headers::trailers(stream.id, trailers);
             frame.set_header_order(order);
+            if let Some(encoding) = stream
+                .body_layout
+                .as_ref()
+                .and_then(|layout| layout.take_trailers())
+            {
+                frame.set_encoding(encoding);
+            }
 
             // Send the trailers frame
             actions
