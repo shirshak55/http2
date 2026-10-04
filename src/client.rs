@@ -236,8 +236,9 @@ impl Control {
     /// [`Self::send_settings_ack`] and [`Self::send_ping_ack`] relay the other peer's
     /// acknowledgements. Once the receiver is dropped, it acknowledges them itself again.
     /// The peer's acknowledgements of the SETTINGS and PINGs sent for the other peer
-    /// ([`Self::send_settings`], [`Self::send_ping`], and those of the preface replayed)
-    /// come too, in their place among those frames.
+    /// ([`Self::send_settings`], [`Self::send_ping`]) come too, in their place among
+    /// those frames, those received before the first call first; not those of the
+    /// connection's own preface, nor of the preface frames a request carried.
     pub fn relay_received(&self) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
         self.inner.relay_received(self.preface.clone())
     }
@@ -320,6 +321,11 @@ impl Control {
     /// the frames following it (see [`Self::after_request`]) no longer wait for it.
     pub fn release_request(&self, recorded: u32) {
         self.inner.release_request(recorded);
+    }
+
+    /// Whether the request recorded as `recorded` went out on this connection.
+    pub fn carries(&self, recorded: u32) -> bool {
+        self.inner.carries(recorded)
     }
 
     /// Sends a GOAWAY frame of `reason` and `debug_data` naming `last_stream_id`, numbered
@@ -1708,9 +1714,12 @@ where
         // as clients send them.
         codec.buffer_raw(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
-        // Send initial settings frame
+        // Send initial settings frame, the connection's own: a relaying caller's peer
+        // acknowledged its own preface's
+        let mut settings = builder.settings.clone();
+        settings.set_own();
         codec
-            .buffer((builder.settings.clone()).into())
+            .buffer(settings.into())
             .expect("invalid SETTINGS frame");
 
         let inner = proto::Connection::new(

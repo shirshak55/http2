@@ -383,10 +383,7 @@ where
                         &mut self.codec,
                         &mut self.inner.streams,
                     )? {
-                        self.inner.streams.as_dyn().relay(LoggedFrame::Settings {
-                            ack: true,
-                            params: Vec::new(),
-                        });
+                        self.inner.streams.as_dyn().relay_settings_ack();
                     }
                 }
                 ReceivedFrame::Continue => (),

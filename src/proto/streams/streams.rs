@@ -161,6 +161,11 @@ struct Inner {
     /// The payloads of the PINGs sent for a relaying caller (a [`Control`]'s, or a
     /// request's preface frames') awaiting the peer's acknowledgements, oldest first
     relayed_pings: VecDeque<[u8; 8]>,
+
+    /// The peer's acknowledgements of the SETTINGS and PINGs sent for a relaying caller
+    /// received before it relayed (see [`Control::relay_received`]), oldest first: it gets
+    /// them first
+    unrelayed_acks: VecDeque<LoggedFrame>,
 }
 
 /// Hands the peer's frames past its connection preface to a caller relaying them.
@@ -499,15 +504,15 @@ where
                     Some(priority) => frame::Leading::Priority(priority),
                     None => continue,
                 },
+                // A preface's SETTINGS and PINGs are the connection's own: a relaying
+                // caller's peer acknowledged those it sent before its first request.
                 PrefaceFrame::Settings(params) => {
                     let mut settings = frame::Settings::default();
                     settings.set_wire(params);
+                    settings.set_own();
                     frame::Leading::Settings(settings)
                 }
-                PrefaceFrame::Ping(payload) => {
-                    me.sent_relayed_ping(payload);
-                    frame::Leading::Ping(frame::Ping::new(payload))
-                }
+                PrefaceFrame::Ping(payload) => frame::Leading::Ping(frame::Ping::new(payload)),
                 PrefaceFrame::Unknown(f) => {
                     if f.payload.len() > frame::MAX_MAX_FRAME_SIZE as usize {
                         return Err(UserError::PayloadTooBig.into());
@@ -762,8 +767,17 @@ impl<B> DynStreams<'_, B> {
             return false;
         };
         me.relayed_pings.remove(at);
-        me.relay(LoggedFrame::Ping { ack: true, payload });
+        me.relay_ack(LoggedFrame::Ping { ack: true, payload });
         true
+    }
+
+    /// Hands the peer's acknowledgement of a SETTINGS frame sent for a relaying caller
+    /// (see [`Control::relay_received`]) to that caller.
+    pub fn relay_settings_ack(&mut self) {
+        self.inner.lock().relay_ack(LoggedFrame::Settings {
+            ack: true,
+            params: Vec::new(),
+        });
     }
 
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
@@ -907,8 +921,17 @@ impl Control {
         preface: ReceivedPreface,
     ) -> tokio::sync::mpsc::UnboundedReceiver<LoggedFrame> {
         let (frames, received) = tokio::sync::mpsc::unbounded_channel();
-        self.inner.lock().relay = Some(Relay { frames, preface });
+        let mut me = self.inner.lock();
+        for ack in me.unrelayed_acks.drain(..) {
+            let _ = frames.send(ack);
+        }
+        me.relay = Some(Relay { frames, preface });
         received
+    }
+
+    /// Whether the request recorded as `recorded` went out on this connection.
+    pub(crate) fn carries(&self, recorded: u32) -> bool {
+        self.inner.lock().opened_stream(recorded).is_some()
     }
 
     /// Queues `priority`, renumbered as [`Inner::recorded_stream`] does when it goes out; a
@@ -1181,6 +1204,20 @@ impl Inner {
         true
     }
 
+    /// Hands `ack`, the peer's acknowledgement of a SETTINGS frame or PING sent for a
+    /// relaying caller, to that caller (see [`Self::relay`]), or keeps it for the caller
+    /// relaying from now on, as the first frames it gets, while none does yet.
+    fn relay_ack(&mut self, ack: LoggedFrame) {
+        if self.relay.is_none() {
+            if self.unrelayed_acks.len() == RELAYED_PINGS {
+                self.unrelayed_acks.pop_front();
+            }
+            self.unrelayed_acks.push_back(ack);
+            return;
+        }
+        self.relay(ack);
+    }
+
     /// Notes a PING carrying `payload` sent for a relaying caller, awaiting its
     /// acknowledgement.
     fn sent_relayed_ping(&mut self, payload: [u8; 8]) {
@@ -1351,6 +1388,7 @@ impl Inner {
             first_recorded: None,
             relay: None,
             relayed_pings: VecDeque::new(),
+            unrelayed_acks: VecDeque::new(),
         }))
     }
 
