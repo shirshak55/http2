@@ -493,6 +493,7 @@ fn logged_frame(frame: &Frame, settings: Option<LoggedFrame>) -> Option<LoggedFr
         Frame::GoAway(f) => Some(LoggedFrame::GoAway {
             last_stream_id: f.last_stream_id().into(),
             error_code: f.reason().into(),
+            debug_data: f.debug_data().clone(),
         }),
         Frame::Data(_) | Frame::PushPromise(_) | Frame::Unknown(_) => None,
     }

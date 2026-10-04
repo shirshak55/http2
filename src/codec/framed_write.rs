@@ -383,6 +383,7 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
                     frame::Leading::GoAway(f) => LoggedFrame::GoAway {
                         last_stream_id: f.last_stream_id().into(),
                         error_code: f.reason().into(),
+                        debug_data: f.debug_data().clone(),
                     },
                 });
             }
@@ -404,6 +405,7 @@ fn log_frame<B>(log: &FrameLog, frame: &Frame<B>) {
         Frame::GoAway(f) => LoggedFrame::GoAway {
             last_stream_id: f.last_stream_id().into(),
             error_code: f.reason().into(),
+            debug_data: f.debug_data().clone(),
         },
         Frame::Unknown(f) => unknown_frame(f),
         Frame::Data(_) | Frame::PushPromise(_) => return,

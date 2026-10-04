@@ -557,6 +557,8 @@ pub enum LoggedFrame {
         last_stream_id: u32,
         /// The error code.
         error_code: u32,
+        /// The additional debug data.
+        debug_data: Bytes,
     },
     /// A frame of a type HTTP/2 doesn't define, such as a GREASE type.
     Unknown {
