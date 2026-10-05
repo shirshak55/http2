@@ -22,7 +22,8 @@ use crate::{
     ext::{
         BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
         HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, OwnWindow,
-        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
+        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, ResponsePosition,
+        SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -996,10 +997,12 @@ pub(crate) struct Queued {
 
 /// Called with the last stream, numbered as the connection requests were recorded on
 /// numbered it, the error code and the debug data of each GOAWAY the peer sends, the
-/// requests sent here it leaves unprocessed, and those whose response frames received
-/// before it the caller didn't take yet, as recorded.
+/// requests sent here it leaves unprocessed, and where it came in the responses to those
+/// up to its last stream, as recorded.
 #[derive(Clone)]
-struct GoAwayHook(Arc<dyn Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync>);
+struct GoAwayHook(
+    Arc<dyn Fn(u32, Reason, Bytes, &[u32], &[(u32, ResponsePosition)]) + std::marker::Send + Sync>,
+);
 
 impl fmt::Debug for GoAwayHook {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1309,12 +1312,14 @@ impl Control {
 
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
     /// [`Inner::recorded_id`] does, its error code, its debug data, the open requests sent
-    /// here past that stream, which it leaves unprocessed, and the requests sent here it
-    /// answered before it (their response heads, or resets, received, or frames the caller
-    /// didn't take yet), as recorded.
+    /// here past that stream, which it leaves unprocessed, and where it came in the
+    /// response to each request sent here up to that stream, as recorded.
     pub(crate) fn on_go_away(
         &self,
-        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + std::marker::Send + Sync + 'static,
+        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[(u32, ResponsePosition)])
+            + std::marker::Send
+            + Sync
+            + 'static,
     ) {
         self.inner.lock().go_away_hook = Some(GoAwayHook(Arc::new(go_away)));
     }
@@ -2307,25 +2312,31 @@ impl Inner {
                 .filter(|(_, opened)| *opened > last_stream_id && self.store.contains(opened))
                 .map(|(recorded, _)| *recorded)
                 .collect();
-            // The caller may have taken their frames yet not passed them on.
+            // Those whose streams are gone were received whole.
             let store = &mut self.store;
-            let unread: Vec<u32> = self
+            let positions: Vec<(u32, ResponsePosition)> = self
                 .recorded_streams
                 .iter()
-                .filter(|(_, opened)| {
-                    *opened <= last_stream_id
-                        && store.find_mut(opened).map_or(true, |stream| {
-                            !stream.state.is_recv_headers() || !stream.pending_recv.is_empty()
-                        })
+                .filter(|(_, opened)| *opened <= last_stream_id)
+                .map(|(recorded, opened)| {
+                    let position = match store.find_mut(opened) {
+                        Some(stream) if stream.state.is_recv_headers() => {
+                            ResponsePosition::BeforeHead
+                        }
+                        Some(stream) if stream.state.is_recv_streaming() => {
+                            ResponsePosition::InBody(stream.data_received)
+                        }
+                        _ => ResponsePosition::Ended,
+                    };
+                    (*recorded, position)
                 })
-                .map(|(recorded, _)| *recorded)
                 .collect();
             (hook.0)(
                 recorded,
                 frame.reason(),
                 frame.debug_data().clone(),
                 &refused,
-                &unread,
+                &positions,
             );
         }
 

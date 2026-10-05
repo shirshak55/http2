@@ -154,6 +154,9 @@ pub(super) struct Stream {
     /// How many of the frames queued right after its HEADERS (see
     /// [`FollowingFrame`](crate::ext::FollowingFrame)) are still to go out, right after it
     pub following: usize,
+
+    /// The octets of DATA payload received on it (padding excluded)
+    pub data_received: u64,
 }
 
 /// State related to validating a stream's content-length
@@ -245,6 +248,7 @@ impl Stream {
             received: None,
             records_received: false,
             following: 0,
+            data_received: 0,
         }
     }
 

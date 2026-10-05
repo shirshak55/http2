@@ -405,12 +405,15 @@ impl Control {
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the
     /// latest request sent here on it or below it was, else as sent; its error code; its
     /// debug data; the open requests sent here past it, which it leaves unprocessed; and
-    /// the requests sent here it answered before it, whose response heads or resets were
-    /// received, or response frames the caller didn't take yet, which a client of the peer
-    /// would get ahead of it, whether or not the caller took them; requests as recorded.
+    /// where it came in the response to each request sent here up to it, whether or not
+    /// the caller took that response's frames yet (a client of the peer gets the frames
+    /// before that point ahead of it, and those past it after it); requests as recorded.
     pub fn on_go_away(
         &self,
-        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[u32]) + Send + Sync + 'static,
+        go_away: impl Fn(u32, Reason, Bytes, &[u32], &[(u32, crate::ext::ResponsePosition)])
+            + Send
+            + Sync
+            + 'static,
     ) {
         self.inner.on_go_away(go_away);
     }

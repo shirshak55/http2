@@ -69,6 +69,19 @@ impl fmt::Debug for Protocol {
 #[derive(Clone, Debug)]
 pub struct ExtendedConnect(pub Protocol);
 
+/// Where a GOAWAY the peer sent came in the response to a request sent before it (see
+/// [`Control::on_go_away`](crate::client::Control::on_go_away)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponsePosition {
+    /// Before its head.
+    BeforeHead,
+    /// After its head and this many octets of its body (DATA payloads, padding excluded),
+    /// before the rest.
+    InBody(u64),
+    /// After all of it: its end, or its reset.
+    Ended,
+}
+
 /// Keeps the flow-control windows of the request it is inserted into the connection's own:
 /// its receive window grows by the data the caller releases, to no more than 1 MiB once the
 /// initial window is spent, and never by the WINDOW_UPDATEs a

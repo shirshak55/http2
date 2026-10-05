@@ -780,6 +780,8 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
         }
 
+        stream.data_received += frame.payload().len() as u64;
+
         if let Some((_, body)) = &stream.received {
             body.push_data(
                 frame.payload().len(),
