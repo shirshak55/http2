@@ -3143,7 +3143,7 @@ impl OpaqueStreamRef {
         }
     }
     /// Called by a client to check for a received response.
-    pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, proto::Error>> {
+    pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, crate::Error>> {
         let mut me = self.inner.lock();
         let me = &mut *me;
 
@@ -3152,6 +3152,10 @@ impl OpaqueStreamRef {
         me.actions
             .recv
             .poll_response(cx, &mut stream)
+            .map_err(|err| match stream.header_list_too_large {
+                true => crate::Error::header_list_too_large(),
+                false => err.into(),
+            })
             .map_ok(|mut response| {
                 if let Some(sent) = stream.sent_headers.take() {
                     response.extensions_mut().insert(sent);

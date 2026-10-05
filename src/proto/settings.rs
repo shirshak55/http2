@@ -55,7 +55,7 @@ impl Settings {
                         codec.set_max_recv_frame_size(max as usize);
                     }
 
-                    if let Some(max) = local.max_header_list_size() {
+                    if let Some(max) = local.max_header_list_size().filter(|_| !local.is_wire()) {
                         codec.set_max_recv_header_list_size(max as usize);
                     }
 

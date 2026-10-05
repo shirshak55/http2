@@ -147,6 +147,9 @@ pub(super) struct Stream {
     /// How the response's header block and body went, when recording frames
     pub received: Option<(HeaderBlockEncoding, BodyFrames)>,
 
+    /// Whether a header list it received was over the size the connection takes
+    pub header_list_too_large: bool,
+
     /// Whether to record how its response's header blocks and body went (see
     /// [`Self::received`]), and a pushed request's header block
     pub records_received: bool,
@@ -246,6 +249,7 @@ impl Stream {
             content_length: ContentLength::Omitted,
             sent_headers: None,
             received: None,
+            header_list_too_large: false,
             records_received: false,
             following: 0,
             data_received: 0,

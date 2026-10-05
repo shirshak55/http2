@@ -238,6 +238,7 @@ impl Recv {
         }
 
         if frame.is_over_size() {
+            stream.header_list_too_large = true;
             // A frame is over size if the decoded header block was bigger than
             // SETTINGS_MAX_HEADER_LIST_SIZE.
             //

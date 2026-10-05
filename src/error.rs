@@ -31,6 +31,10 @@ enum Kind {
     /// A GO_AWAY frame was received or sent.
     GoAway(Bytes, Reason, Initiator),
 
+    /// A response's header list was over the size the connection takes, so its stream was
+    /// reset with PROTOCOL_ERROR.
+    HeaderListTooLarge,
+
     /// The user created an error from a bare Reason.
     Reason(Reason),
 
@@ -54,6 +58,7 @@ impl Error {
             Kind::Reset(_, reason, _) | Kind::GoAway(_, reason, _) | Kind::Reason(reason) => {
                 Some(reason)
             }
+            Kind::HeaderListTooLarge => Some(Reason::PROTOCOL_ERROR),
             _ => None,
         }
     }
@@ -92,7 +97,7 @@ impl Error {
 
     /// Returns true if the error is from a `RST_STREAM`.
     pub fn is_reset(&self) -> bool {
-        matches!(self.kind, Kind::Reset(..))
+        matches!(self.kind, Kind::Reset(..) | Kind::HeaderListTooLarge)
     }
 
     /// Returns true if the error was received in a frame from the remote.
@@ -111,8 +116,22 @@ impl Error {
     pub fn is_library(&self) -> bool {
         matches!(
             self.kind,
-            Kind::GoAway(_, _, Initiator::Library) | Kind::Reset(_, _, Initiator::Library)
+            Kind::GoAway(_, _, Initiator::Library)
+                | Kind::Reset(_, _, Initiator::Library)
+                | Kind::HeaderListTooLarge
         )
+    }
+
+    /// Whether the response's header list was over the size the connection takes (16 MiB,
+    /// or less as its own SETTINGS set), so its stream was reset with PROTOCOL_ERROR.
+    pub fn is_header_list_too_large(&self) -> bool {
+        matches!(self.kind, Kind::HeaderListTooLarge)
+    }
+
+    pub(crate) fn header_list_too_large() -> Self {
+        Error {
+            kind: Kind::HeaderListTooLarge,
+        }
     }
 
     /// Whether the request wasn't sent because it was an extended CONNECT (`:protocol`) and
@@ -180,6 +199,12 @@ impl fmt::Display for Error {
             }
             Kind::Reset(_, reason, Initiator::Remote) => {
                 return write!(fmt, "stream error received: {}", reason)
+            }
+            Kind::HeaderListTooLarge => {
+                return write!(
+                    fmt,
+                    "stream error detected: the response's header list is over the size limit"
+                )
             }
             Kind::GoAway(ref debug_data, reason, Initiator::User) => {
                 write!(fmt, "connection error sent by user: {}", reason)?;

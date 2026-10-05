@@ -1802,7 +1802,8 @@ where
             codec.set_max_recv_frame_size(max as usize);
         }
 
-        if let Some(max) = builder.settings.max_header_list_size() {
+        let wire = builder.settings.is_wire();
+        if let Some(max) = builder.settings.max_header_list_size().filter(|_| !wire) {
             codec.set_max_recv_header_list_size(max as usize);
         }
 

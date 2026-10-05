@@ -298,6 +298,13 @@ impl Settings {
         self.own
     }
 
+    /// Whether it is exactly a caller's parameters (see [`Self::set_wire`]), whose
+    /// MAX_HEADER_LIST_SIZE is advertised only: the header lists received stay bounded by
+    /// the default 16 MiB.
+    pub(crate) fn is_wire(&self) -> bool {
+        self.wire.is_some()
+    }
+
     pub fn initial_window_size(&self) -> Option<u32> {
         self.initial_window_size
     }
