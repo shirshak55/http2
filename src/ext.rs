@@ -189,9 +189,10 @@ pub struct DataFrame {
 ///
 /// A request sent with a [`SendBodyLayout`] goes so: ahead of each chunk of its body go
 /// the empty DATA frames the layout has there, the chunk takes its frame's padding when
-/// their lengths match, and its end goes in a frame of its own when the layout's did, as
-/// far as the peer's frame size and flow control allow a padded frame whole. Its
-/// trailers' header block goes as [`HeaderBlockEncoding`] says.
+/// their lengths match, and its end goes in a frame of its own when the layout's did. A
+/// padded frame the peer's frame size or flow control can't take whole goes split, data
+/// first, its padding kept. Its trailers' header block goes as [`HeaderBlockEncoding`]
+/// says.
 pub trait BodyLayout: Send + Sync {
     /// Removes and returns the DATA frames it holds that went no later than the DATA
     /// frame carrying data at `through`, or every one given `None`.

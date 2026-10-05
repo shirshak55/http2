@@ -242,7 +242,7 @@ impl Prioritize {
         // Sending out zero length data frames can be done to signal
         // end-of-stream.
         //
-        // Its planned padding aside: without the window for it, it goes unpadded.
+        // Its planned padding aside, which `pop_frame` sends as the window allows.
         if stream.send_flow.available() > 0 || stream.buffered_send_data == padding {
             // The stream currently has capacity to send the data frame, so
             // queue it up and notify the connection task.
@@ -737,9 +737,9 @@ impl Prioritize {
                 frame.set_end_stream(true);
             }
 
-            // Its planned frames go whatever the window: an empty one takes none of it, and
-            // padding it lacks room for is dropped. A stream reset since sends the rest only
-            // as far as it goes at once.
+            // Its planned frames go whatever the window: an empty one takes none of it but
+            // for its padding, which `pop_frame` splits to fit. A stream reset since sends
+            // the rest only as far as it goes at once.
             let planned = !frame.plan_mut().is_empty() || Self::flushes_before_reset(&stream);
             self.push_back_frame(frame.into(), buffer, &mut stream);
             if planned {
@@ -896,13 +896,25 @@ impl Prioritize {
                                 _ => frame.payload().remaining(),
                             };
 
-                            // A padded frame goes whole, else unpadded.
+                            // A padded frame goes whole, waiting for the capacity its
+                            // padding takes too, unless it must go at once: it then goes
+                            // unpadded. One the frame size, the stream's window or the
+                            // connection's capacity other streams don't hold can't take
+                            // whole goes split, its padding kept: as many of its octets as
+                            // fit go now, data first, so the window runs out (a peer
+                            // granting more only then still does), and the rest after, the
+                            // padding left on an empty frame of pad length `rest` once the
+                            // data went.
                             let mut padding = planned.and_then(|planned| planned.padding);
-                            let padded_len = sz + padding.map_or(0, |pad| usize::from(pad) + 1);
+                            let mut padded_len = sz + padding.map_or(0, |pad| usize::from(pad) + 1);
+                            let fits = max_len.min(stream.send_flow.window_size() as usize).min(
+                                stream_capacity.as_size() as usize
+                                    + self.flow.available().as_size() as usize,
+                            );
+                            let mut rest = None;
                             if padding.is_some()
-                                && (padded_len > max_len
-                                    || padded_len > stream_capacity.as_size() as usize
-                                    || padded_len > stream.send_flow.window_size() as usize)
+                                && flushing
+                                && padded_len > stream_capacity.as_size() as usize
                             {
                                 self.drop_padding(padded_len - sz, &mut stream, counts);
                                 if let Some(layout) = &stream.body_layout {
@@ -910,6 +922,20 @@ impl Prioritize {
                                 }
                                 frame.plan_mut()[0].padding = None;
                                 padding = None;
+                            } else if let Some(pad) = padding {
+                                let take = fits.min(stream_capacity.as_size() as usize);
+                                if padded_len > fits && take > 0 {
+                                    if take <= sz {
+                                        padding = None;
+                                        rest = Some(pad);
+                                    } else {
+                                        let now = u8::try_from(take - sz - 1)
+                                            .expect("a split frame takes less than its padding");
+                                        padding = Some(now);
+                                        rest = Some(pad - now - 1);
+                                    }
+                                    padded_len = take;
+                                }
                             }
                             let padding_len = padding.map_or(0, |pad| WindowSize::from(pad) + 1);
 
@@ -924,8 +950,11 @@ impl Prioritize {
                             );
 
                             // Zero length data frames always have capacity to
-                            // be sent.
-                            if sz > 0 && stream_capacity == 0 {
+                            // be sent, but for their padding.
+                            if (sz > 0 && stream_capacity == 0)
+                                || (padding.is_some()
+                                    && padded_len > stream_capacity.as_size() as usize)
+                            {
                                 tracing::trace!("stream capacity is 0");
 
                                 // Ensure that the stream is waiting for
@@ -949,6 +978,11 @@ impl Prioritize {
 
                             // Only send up to the max frame length
                             let len = cmp::min(sz, max_len);
+                            let len = if rest.is_some() {
+                                cmp::min(len, padded_len - padding_len as usize)
+                            } else {
+                                len
+                            };
 
                             // Only send up to the stream's window capacity
                             let len =
@@ -1005,7 +1039,16 @@ impl Prioritize {
 
                                 // The planned frame went once it carried its data.
                                 if planned.is_some() && len == sz {
-                                    frame.plan_mut().pop_front();
+                                    match rest {
+                                        Some(pad) => {
+                                            let left = &mut frame.plan_mut()[0];
+                                            left.data = false;
+                                            left.padding = Some(pad);
+                                        }
+                                        None => {
+                                            frame.plan_mut().pop_front();
+                                        }
+                                    }
                                 }
                                 stream.sending_planned = !frame.plan_mut().is_empty();
                                 if frame.payload().remaining() > len || !frame.plan_mut().is_empty()
