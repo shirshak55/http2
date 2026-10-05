@@ -381,6 +381,12 @@ impl Control {
         self.inner.carries(recorded)
     }
 
+    /// The error code of the GOAWAY the server sent with one, if it did: it takes nothing
+    /// sent from then on, acknowledging none of the SETTINGS and PINGs still awaiting it.
+    pub fn go_away_error(&self) -> Option<Reason> {
+        self.inner.go_away_error()
+    }
+
     /// The flow-controlled octets (padding included) of the DATA frames the connection
     /// sent so far, which the server's connection WINDOW_UPDATEs grant back.
     pub fn data_sent(&self) -> u64 {

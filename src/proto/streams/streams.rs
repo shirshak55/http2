@@ -155,6 +155,13 @@ struct Inner {
     /// The tasks waiting for those frames to leave room for more (see [`Control::poll_room`])
     room_tasks: Vec<Waker>,
 
+    /// Whether the connection ended, or failed: it sends nothing more
+    ended: bool,
+
+    /// The error code of the peer's GOAWAY, once it sent one with an error code: it then
+    /// takes nothing more sent (RFC 9113 §6.8), the connection closing
+    go_away_error: Option<Reason>,
+
     /// Logs the frames sent, when recording them
     frame_log: Option<FrameLog>,
 
@@ -626,8 +633,11 @@ where
                 })
             })
             .collect();
+        // Its own window's grants are for the data sent here, not the caller's (see
+        // `OwnWindow`).
         let following = following
             .into_iter()
+            .filter(|frame| !(own_window && matches!(frame, FollowingFrame::WindowUpdate(_))))
             .map(|frame| match frame {
                 FollowingFrame::WindowUpdate(increment) => {
                     stream
@@ -1249,16 +1259,23 @@ impl Control {
     }
 
     /// Ready once the frames it queued (see [`Queued`]) leave room for more, fewer and
-    /// smaller than it lets wait their turn, or the connection ended.
+    /// smaller than it lets wait their turn, or the connection sends nothing more (see
+    /// [`Inner::finished`]); a peer's graceful GOAWAY, after which the requests up to its
+    /// last stream go on, leaves the room as it was.
     pub(crate) fn poll_room(&self, cx: &mut Context) -> Poll<()> {
         let mut me = self.inner.lock();
-        if !me.backlogged() || me.actions.conn_error.is_some() {
+        if !me.backlogged() || me.finished() {
             return Poll::Ready(());
         }
         if !me.room_tasks.iter().any(|task| task.will_wake(cx.waker())) {
             me.room_tasks.push(cx.waker().clone());
         }
         Poll::Pending
+    }
+
+    /// The error code of the GOAWAY the peer sent with one, if it did.
+    pub(crate) fn go_away_error(&self) -> Option<Reason> {
+        self.inner.lock().go_away_error
     }
 
     /// The flow-controlled octets of the DATA frames the connection sent so far.
@@ -1360,7 +1377,7 @@ impl Control {
     pub(crate) fn release_request(&self, recorded: u32) {
         let mut me = self.inner.lock();
         me.held.retain(|held| *held != recorded);
-        if me.opened_stream(recorded).is_some() {
+        if me.opened_stream(recorded).is_some() || me.released.contains(&recorded) {
             return;
         }
         if me.released.len() == RECORDED_STREAMS {
@@ -1415,9 +1432,13 @@ impl Control {
             .map_or(false, |stream| stream.body_layout.is_some())
     }
 
-    /// Queues `frame` for the connection's task, waking it.
+    /// Queues `frame` for the connection's task, waking it; none once the connection sends
+    /// nothing more (see [`Inner::finished`]).
     fn queue(&self, frame: ControlFrame) {
         let mut me = self.inner.lock();
+        if me.finished() {
+            return;
+        }
         // A GOAWAY supersedes one queued that didn't go out yet (RFC 9113 §6.8).
         if matches!(frame, ControlFrame::GoAway(..)) {
             if let Some(at) = me
@@ -1528,6 +1549,12 @@ impl Inner {
     /// their turn.
     fn backlogged(&self) -> bool {
         self.control.len() >= CONTROL_FRAMES || self.control_octets >= CONTROL_OCTETS
+    }
+
+    /// Whether the connection sends nothing more that counts: it ended, or failed, or its
+    /// peer sent a GOAWAY with an error code.
+    fn finished(&self) -> bool {
+        self.ended || self.go_away_error.is_some()
     }
 
     /// The earliest relayed SETTINGS frame awaiting the relayed peer's acknowledgement, which
@@ -1947,6 +1974,8 @@ impl Inner {
             control_unflushed: false,
             sent_tasks: Vec::new(),
             room_tasks: Vec::new(),
+            ended: false,
+            go_away_error: None,
             frame_log: config.frame_log,
             received_frame_log: config.received_frame_log,
             recorded_streams: VecDeque::new(),
@@ -2284,9 +2313,13 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        self.ended = true;
         // The caller relaying the peer's frames gets no more.
         if let Some(relay) = self.relay.take() {
             relay.end();
+        }
+        for task in self.room_tasks.drain(..) {
+            task.wake();
         }
 
         last_processed_id
@@ -2343,6 +2376,12 @@ impl Inner {
         }
 
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
+        if frame.reason() != Reason::NO_ERROR {
+            self.go_away_error = Some(frame.reason());
+            for task in self.room_tasks.drain(..) {
+                task.wake();
+            }
+        }
 
         let peer = counts.peer();
         self.store.for_each(|stream| {
@@ -2491,6 +2530,7 @@ impl Inner {
 
         tracing::trace!("Streams::recv_eof");
 
+        self.ended = true;
         for task in self.sent_tasks.drain(..).chain(self.room_tasks.drain(..)) {
             task.wake();
         }
