@@ -21,9 +21,8 @@ use crate::{
     codec::{Codec, SendError, UserError},
     ext::{
         BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
-        HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo,
-        OwnWindow, PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes,
-        SendBodyLayout,
+        HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, OwnWindow,
+        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -1725,10 +1724,7 @@ impl Inner {
         }
         // Its grants for an own window are for the data sent here, not the relayed peer's.
         if let LoggedFrame::WindowUpdate { stream_id, .. } = frame {
-            if self
-                .store
-                .find_mut(&StreamId::from(stream_id))
-                .is_some_and(|stream| stream.own_window)
+            if matches!(self.store.find_mut(&StreamId::from(stream_id)), Some(stream) if stream.own_window)
             {
                 return false;
             }
