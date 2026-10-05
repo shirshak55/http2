@@ -246,8 +246,7 @@ impl Control {
     }
 
     /// Sends a PING carrying `payload`, whose acknowledgement goes to the caller relaying the
-    /// frames past the peer's preface (see [`Self::relay_received`]), if any; while 1,024
-    /// sent so await theirs, it waits, and the frames sent after it.
+    /// frames past the peer's preface (see [`Self::relay_received`]), if any.
     pub fn send_ping(&self, payload: [u8; 8]) {
         self.inner.send_ping(payload);
     }

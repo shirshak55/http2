@@ -196,6 +196,10 @@ struct Inner {
     /// request's preface frames') awaiting the peer's acknowledgements, oldest first
     relayed_pings: VecDeque<[u8; 8]>,
 
+    /// How many of those PINGs no longer have their payloads there (see [`RELAYED_PINGS`])
+    /// without their acknowledgements having come
+    unrecorded_pings: usize,
+
     /// The peer's acknowledgements of the SETTINGS and PINGs sent for a relaying caller
     /// received before it relayed (see [`Control::relay_received`]), oldest first: it gets
     /// them first
@@ -249,8 +253,9 @@ pub(crate) struct RelayedFrames {
 /// The PRIORITY_UPDATE frame type (RFC 9218).
 const PRIORITY_UPDATE: u8 = 0x10;
 
-/// How many PINGs sent for a relaying caller await acknowledgements at most: one more
-/// waits, and the frames queued after it, until an acknowledgement comes.
+/// How many PINGs sent for a relaying caller have their payloads kept awaiting
+/// acknowledgements at most: past them the oldest's goes, and while any went, an
+/// acknowledgement of none kept, nor of the connection's own, goes to the caller.
 const RELAYED_PINGS: usize = 1024;
 
 /// How many frames received await the caller relaying them, or relayed SETTINGS the
@@ -741,9 +746,6 @@ where
                     at += 1;
                     continue;
                 }
-                if me.holds_ping(&queued.frame) {
-                    break;
-                }
                 let queued = me.control.remove(at).expect("a frame is queued");
                 me.control_octets -= queued.frame.octets();
                 let frame = match queued.frame {
@@ -933,10 +935,18 @@ impl<B> DynStreams<'_, B> {
     /// caller (see [`Control::relay_received`]) to that caller; whether it was one.
     pub fn relay_ping_ack(&mut self, payload: [u8; 8]) -> bool {
         let mut me = self.inner.lock();
-        let Some(at) = me.relayed_pings.iter().position(|sent| *sent == payload) else {
-            return false;
-        };
-        me.relayed_pings.remove(at);
+        match me.relayed_pings.iter().position(|sent| *sent == payload) {
+            Some(at) => {
+                me.relayed_pings.remove(at);
+            }
+            None if me.unrecorded_pings > 0
+                && payload != frame::Ping::USER
+                && payload != frame::Ping::SHUTDOWN =>
+            {
+                me.unrecorded_pings -= 1;
+            }
+            None => return false,
+        }
         me.relay_ack(LoggedFrame::Ping { ack: true, payload });
         true
     }
@@ -1586,9 +1596,6 @@ impl Inner {
                 at += 1;
                 continue;
             }
-            if self.holds_ping(&queued.frame) {
-                break;
-            }
             ready!(dst.poll_ready(cx))?;
             let queued = self.control.remove(at).expect("a frame is queued");
             self.control_octets -= queued.frame.octets();
@@ -1876,14 +1883,11 @@ impl Inner {
     /// Notes a PING carrying `payload` sent for a relaying caller, awaiting its
     /// acknowledgement.
     fn sent_relayed_ping(&mut self, payload: [u8; 8]) {
+        if self.relayed_pings.len() == RELAYED_PINGS {
+            self.relayed_pings.pop_front();
+            self.unrecorded_pings += 1;
+        }
         self.relayed_pings.push_back(payload);
-    }
-
-    /// Whether `frame`, queued (see [`Queued`]), is a PING that waits, and the frames
-    /// queued after it, while as many sent for a relaying caller as may await
-    /// acknowledgements do (see [`RELAYED_PINGS`]).
-    fn holds_ping(&self, frame: &ControlFrame) -> bool {
-        matches!(frame, ControlFrame::Ping(_)) && self.relayed_pings.len() >= RELAYED_PINGS
     }
 
     /// The request, as recorded (see [`HeadersFrameOptions::recorded_stream_id`]), that went
@@ -2075,6 +2079,7 @@ impl Inner {
             first_recorded: None,
             relay: None,
             relayed_pings: VecDeque::new(),
+            unrecorded_pings: 0,
             unrelayed_acks: VecDeque::new(),
             relayed_settings: VecDeque::new(),
             relayed_settings_octets: 0,
