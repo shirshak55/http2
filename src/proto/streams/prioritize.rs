@@ -135,6 +135,11 @@ impl Prioritize {
         self.headers_sent
     }
 
+    /// Whether a stream waits for the peer to let it open.
+    pub(crate) fn has_pending_open(&self) -> bool {
+        !self.pending_open.is_empty()
+    }
+
     /// The flow-controlled octets of the DATA frames sent so far.
     pub(crate) fn data_sent(&self) -> u64 {
         self.data_sent

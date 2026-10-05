@@ -66,6 +66,11 @@ impl Send {
         self.prioritize.headers_sent()
     }
 
+    /// Whether a stream waits for the peer to let it open (see `Prioritize::queue_open`).
+    pub fn has_pending_open(&self) -> bool {
+        self.prioritize.has_pending_open()
+    }
+
     /// The peer's relayed SETTINGS frames the HEADERS written last acknowledged (see
     /// `Prioritize::take_relayed_acked`).
     pub(crate) fn take_relayed_acked(&mut self) -> Vec<frame::Settings> {

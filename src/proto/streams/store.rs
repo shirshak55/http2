@@ -103,6 +103,11 @@ impl Store {
         })
     }
 
+    /// The stream `id`, if open, or still sending, here.
+    pub fn find(&self, id: &StreamId) -> Option<&Stream> {
+        self.ids.get(id).map(|index| &self.slab[index.0 as usize])
+    }
+
     /// Whether the stream `id` is open, or still sending, here.
     pub fn contains(&self, id: &StreamId) -> bool {
         self.ids.contains_key(id)

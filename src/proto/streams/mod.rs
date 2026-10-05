@@ -15,7 +15,7 @@ pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
 pub(crate) use self::streams::{
-    Control, DynStreams, OpaqueStreamRef, RelayedFrames, StreamRef, Streams,
+    Control, DynStreams, ExpectedRequest, OpaqueStreamRef, RelayedFrames, StreamRef, Streams,
 };
 
 use self::buffer::Buffer;

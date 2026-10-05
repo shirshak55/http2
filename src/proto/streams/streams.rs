@@ -1,7 +1,10 @@
 use std::{
     collections::VecDeque,
     fmt, io,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -127,6 +130,10 @@ struct Inner {
     /// The requests, numbered so, their clients reset before they went out here, each with
     /// the reset's code (see [`Control::cancel_with`]), newest last
     cancels: VecDeque<(u32, Reason)>,
+
+    /// The requests, numbered so, on their way to this connection and not sent here yet,
+    /// each with its [`ExpectedRequest`]'s token (see [`Control::expect_request`])
+    expected: Vec<(u64, u32)>,
 
     /// The streams of requests that went out whole their clients reset since, to reset so
     /// (see [`Control::cancel_with`])
@@ -718,6 +725,13 @@ where
                 !evicted
             });
             me.recorded_streams.push_back((recorded, stream_id));
+            if let Some(at) = me
+                .expected
+                .iter()
+                .position(|(_, expected)| *expected == recorded)
+            {
+                me.expected.swap_remove(at);
+            }
             // The frames queued ahead of it (see `Control`) go out right before its HEADERS,
             // but those about a held request's stream, which wait for it; an acknowledgement
             // of the peer's relayed SETTINGS applies them as it goes (see `poll_control`).
@@ -1132,6 +1146,39 @@ impl RelayedFrames {
     }
 }
 
+/// A request on its way to a connection (see [`Control::expect_request`]), which it no
+/// longer waits for once this is dropped.
+pub(crate) struct ExpectedRequest {
+    inner: Weak<Mutex<Inner>>,
+    token: u64,
+}
+
+impl fmt::Debug for ExpectedRequest {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("ExpectedRequest").finish_non_exhaustive()
+    }
+}
+
+impl Drop for ExpectedRequest {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut me = inner.lock();
+        let Some(at) = me
+            .expected
+            .iter()
+            .position(|(token, _)| *token == self.token)
+        else {
+            return;
+        };
+        me.expected.swap_remove(at);
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+}
+
 impl fmt::Debug for RelayedFrames {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("RelayedFrames").finish_non_exhaustive()
@@ -1407,6 +1454,20 @@ impl Control {
         }
     }
 
+    /// Tells that the request recorded as `recorded` is on its way to this connection: until
+    /// it is sent here, or the [`ExpectedRequest`] returned is dropped, the frames following
+    /// a later request that don't wait for that one's HEADERS here (it was released or held,
+    /// see [`Self::release_request`]) wait for this one's (see [`Inner::sent_before`]).
+    pub(crate) fn expect_request(&self, recorded: u32) -> ExpectedRequest {
+        static TOKENS: AtomicU64 = AtomicU64::new(0);
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed);
+        self.inner.lock().expected.push((token, recorded));
+        ExpectedRequest {
+            inner: Arc::downgrade(&self.inner),
+            token,
+        }
+    }
+
     /// Makes the receive window of the request recorded as `recorded`, if sent here, grow
     /// only by the WINDOW_UPDATEs [`Self::send_window_update`] sends, as the connection's
     /// does for the data it receives (see [`FlowControl::set_mirror`]).
@@ -1667,8 +1728,8 @@ impl Inner {
     /// [`Queued::after`]).
     fn follows(&self, after: u32) -> bool {
         after == 0
-            || self.released.contains(&after)
-            || self.held.contains(&after)
+            || ((self.released.contains(&after) || self.held.contains(&after))
+                && self.sent_before(after))
             || match self.opened_stream(after) {
                 Some(opened) => opened <= self.actions.send.headers_sent(),
                 None => self
@@ -1825,6 +1886,26 @@ impl Inner {
             .map(|(recorded, _)| *recorded)
     }
 
+    /// Whether the requests recorded below `after` that come here went out as far as they go
+    /// now: none is still on its way (see [`Control::expect_request`]) nor has its HEADERS
+    /// waiting to go. While the peer's limit on concurrent streams keeps one from opening,
+    /// which those behind it wait for too, they needn't: the peer's streams may need the
+    /// frames following them to end.
+    fn sent_before(&self, after: u32) -> bool {
+        if self.actions.send.has_pending_open() && !self.counts.can_inc_num_send_streams() {
+            return true;
+        }
+        let headers_sent = self.actions.send.headers_sent();
+        !self.expected.iter().any(|(_, expected)| *expected < after)
+            && self.recorded_streams.iter().all(|(recorded, opened)| {
+                *recorded >= after
+                    || *opened <= headers_sent
+                    || !self.store.find(opened).map_or(false, |stream| {
+                        stream.is_pending_open || stream.is_pending_send
+                    })
+            })
+    }
+
     /// The stream the request recorded as `recorded` (see
     /// [`HeadersFrameOptions::recorded_stream_id`]) went out on here, if it did.
     fn opened_stream(&self, recorded: u32) -> Option<StreamId> {
@@ -1966,6 +2047,7 @@ impl Inner {
             released: VecDeque::new(),
             held: VecDeque::new(),
             cancels: VecDeque::new(),
+            expected: Vec::new(),
             resets: Vec::new(),
             went_away: false,
             leaves_close: false,

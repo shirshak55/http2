@@ -217,6 +217,13 @@ impl RelayedFrames {
     }
 }
 
+/// A request on its way to a connection (see [`Control::expect_request`]), which it no
+/// longer waits for once this is dropped.
+#[derive(Debug)]
+pub struct ExpectedRequest {
+    _request: proto::ExpectedRequest,
+}
+
 impl Control {
     /// A handle whose frames follow the request recorded as `recorded` (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)): each
@@ -379,6 +386,17 @@ impl Control {
     /// Whether the request recorded as `recorded` went out on this connection.
     pub fn carries(&self, recorded: u32) -> bool {
         self.inner.carries(recorded)
+    }
+
+    /// Tells that the request recorded as `recorded` is on its way to this connection: until
+    /// it is sent here, or the [`ExpectedRequest`] returned is dropped, the frames following
+    /// a later request that don't wait for that one's HEADERS here (see
+    /// [`Self::release_request`] and [`Self::hold_request`]) wait for this one's, unless the
+    /// server's limit on concurrent streams keeps one from opening.
+    pub fn expect_request(&self, recorded: u32) -> ExpectedRequest {
+        ExpectedRequest {
+            _request: self.inner.expect_request(recorded),
+        }
     }
 
     /// The error code of the GOAWAY the server sent with one, if it did: it takes nothing
