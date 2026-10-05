@@ -701,8 +701,8 @@ async fn rst_stream_expires() {
         srv.send_frame(frames::data(1, vec![0; 16_384]).eos()).await;
         // window capacity is returned
         srv.recv_frame(frames::window_update(0, 16_384 * 2)).await;
-        // and then stream error
-        srv.recv_frame(frames::reset(1).stream_closed()).await;
+        // and the frame ignored, its stream reset by the client
+        srv.ping_pong([2; 8]).await;
     };
 
     let client = async move {
@@ -760,9 +760,9 @@ async fn rst_stream_max() {
         srv.send_frame(frames::data(1, vec![0; 16]).eos()).await;
         // ping pong to be sure of no goaway
         srv.ping_pong([1; 8]).await;
-        // 3 has been evicted, will get a reset
+        // 3 has been evicted, its frames still ignored, as reset by the client
         srv.send_frame(frames::data(3, vec![0; 16]).eos()).await;
-        srv.recv_frame(frames::reset(3).stream_closed()).await;
+        srv.ping_pong([2; 8]).await;
     };
 
     let client = async move {
