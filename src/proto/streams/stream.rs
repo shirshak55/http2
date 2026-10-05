@@ -124,6 +124,9 @@ pub(super) struct Stream {
     /// it, in their own's stead (see `Control::cancel_with`)
     pub cancel_reason: Option<Reason>,
 
+    /// Whether its receive window is the connection's own (see `ext::OwnWindow`)
+    pub own_window: bool,
+
     /// How its body goes, when as another connection received one (see
     /// `ext::SendBodyLayout`)
     pub body_layout: Option<std::sync::Arc<dyn BodyLayout>>,
@@ -233,6 +236,7 @@ impl Stream {
             pending_push_promises: store::Queue::new(),
             refuse_pushes: false,
             cancel_reason: None,
+            own_window: false,
             body_layout: None,
             body_chunks: 0,
             body_frames: std::collections::VecDeque::new(),

@@ -69,6 +69,15 @@ impl fmt::Debug for Protocol {
 #[derive(Clone, Debug)]
 pub struct ExtendedConnect(pub Protocol);
 
+/// Keeps the flow-control windows of the request it is inserted into the connection's own:
+/// its receive window grows by the data the caller releases, to no more than 1 MiB once the
+/// initial window is spent, and never by the WINDOW_UPDATEs a
+/// [`Control`](crate::client::Control) relays for it, and the peer's WINDOW_UPDATEs for it
+/// aren't relayed. For a stream whose DATA the caller relays changed, whose peers' grants
+/// are for the data the caller sent each, not the data the other sent.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnWindow;
+
 /// The names of a message's header fields in the order its header block carries them,
 /// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
 ///

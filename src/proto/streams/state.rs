@@ -52,6 +52,9 @@ use self::Peer::*;
 #[derive(Clone)]
 pub struct State {
     inner: Inner,
+    /// Whether the peer reset it with NO_ERROR once it had ended its side (RFC 9113 §8.1):
+    /// what it received is whole.
+    reset_after_end: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +285,8 @@ impl State {
                     _state,
                     queued
                 );
+                self.reset_after_end = frame.reason() == Reason::NO_ERROR
+                    && matches!(self.inner, HalfClosedRemote(..) | Closed(Cause::EndStream));
                 self.inner = Closed(Cause::Error(Error::remote_reset(
                     frame.stream_id(),
                     frame.reason(),
@@ -441,6 +446,8 @@ impl State {
     pub fn ensure_recv_open(&self) -> Result<bool, proto::Error> {
         // TODO: Is this correct?
         match self.inner {
+            // A reset ending no more than the peer's request for the rest of ours.
+            Closed(Cause::Error(_)) if self.reset_after_end => Ok(false),
             Closed(Cause::Error(ref e)) => Err(e.clone()),
             Closed(Cause::ScheduledLibraryReset(reason)) => {
                 Err(proto::Error::library_go_away(reason))
@@ -471,7 +478,10 @@ impl State {
 
 impl Default for State {
     fn default() -> State {
-        State { inner: Inner::Idle }
+        State {
+            inner: Inner::Idle,
+            reset_after_end: false,
+        }
     }
 }
 

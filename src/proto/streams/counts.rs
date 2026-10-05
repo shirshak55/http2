@@ -1,6 +1,12 @@
 use super::*;
 use crate::tracing;
 
+use std::collections::VecDeque;
+
+/// How many of the streams it reset, then released, a connection remembers past the reset
+/// streams it keeps whole (see [`Counts::reset_forgotten`]).
+const FORGOTTEN_RESETS: usize = 4096;
+
 #[derive(Debug)]
 pub(super) struct Counts {
     /// Acting as a client or server. This allows us to track which values to
@@ -40,6 +46,10 @@ pub(super) struct Counts {
     /// Total number of locally reset streams due to protocol error across the
     /// lifetime of the connection.
     num_local_error_reset_streams: usize,
+
+    /// The latest streams reset here, then released, whose peer's frames sent before it
+    /// got the reset are ignored (see [`Self::reset_forgotten`]).
+    forgotten_resets: VecDeque<StreamId>,
 }
 
 impl Counts {
@@ -57,7 +67,15 @@ impl Counts {
             num_remote_reset_streams: 0,
             max_local_error_reset_streams: config.local_max_error_reset_streams,
             num_local_error_reset_streams: 0,
+            forgotten_resets: VecDeque::new(),
         }
+    }
+
+    /// Whether stream `id` is one of the latest reset here and released since: the frames
+    /// its peer sent before it got the reset are ignored (RFC 9113 §5.1), rather than
+    /// answered with STREAM_CLOSED, as those of a stream it ended otherwise are.
+    pub fn reset_forgotten(&self, id: StreamId) -> bool {
+        self.forgotten_resets.contains(&id)
     }
 
     /// Returns true when the next opened stream will reach capacity of outbound streams
@@ -241,6 +259,12 @@ impl Counts {
 
         // Release the stream if it requires releasing
         if stream.is_released() {
+            if stream.state.is_local_error() {
+                if self.forgotten_resets.len() == FORGOTTEN_RESETS {
+                    self.forgotten_resets.pop_front();
+                }
+                self.forgotten_resets.push_back(stream.id);
+            }
             stream.remove();
         }
     }

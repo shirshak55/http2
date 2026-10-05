@@ -22,7 +22,8 @@ use crate::{
     ext::{
         BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
         HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo,
-        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, SendBodyLayout,
+        OwnWindow, PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes,
+        SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -451,6 +452,7 @@ where
         let encoding = request.extensions_mut().remove::<HeaderBlockEncoding>();
         let body_layout = request.extensions_mut().remove::<SendBodyLayout>();
         let refuse_pushes = request.extensions_mut().remove::<RefusePushes>().is_some();
+        let own_window = request.extensions_mut().remove::<OwnWindow>().is_some();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
@@ -523,6 +525,16 @@ where
             .set_threshold(me.actions.recv.stream_threshold());
         stream.refuse_pushes = refuse_pushes;
         stream.body_layout = body_layout.map(|layout| layout.0);
+        if own_window {
+            stream.own_window = true;
+            // Past its initial window, it grows to no more than this.
+            const OWN_WINDOW: WindowSize = 1 << 20;
+            let excess = me.actions.recv.init_window_sz().saturating_sub(OWN_WINDOW);
+            if excess > 0 {
+                let _res = stream.recv_flow.claim_capacity(excess);
+                debug_assert!(_res.is_ok());
+            }
+        }
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -1570,11 +1582,21 @@ impl Inner {
             relay.end();
             relay.wake_reader();
         }
-        let queued = self
-            .control
-            .iter()
-            .filter(|queued| matches!(queued.frame, ControlFrame::SettingsAck))
-            .count();
+        // The relayed peer's acknowledgements waiting for a request that may never go out
+        // here give way to the connection's own.
+        let mut queued = 0;
+        let mut at = 0;
+        while let Some(waiting) = self.control.get(at) {
+            if !matches!(waiting.frame, ControlFrame::SettingsAck) {
+                at += 1;
+            } else if self.follows(waiting.after) {
+                queued += 1;
+                at += 1;
+            } else {
+                let dropped = self.control.remove(at).expect("a frame is queued");
+                self.control_octets -= dropped.frame.octets();
+            }
+        }
         let acks = self.relayed_settings.len().saturating_sub(queued);
         let pongs = std::mem::take(&mut self.relayed_peer_pings);
         // Ahead of the frames queued, which may wait for a request that never opens.
@@ -1667,6 +1689,9 @@ impl Inner {
             ControlFrame::WindowUpdate(stream_id, increment) => {
                 let stream_id = self.opened_stream(stream_id)?;
                 if let Some(mut stream) = self.store.find_mut(&stream_id) {
+                    if stream.own_window {
+                        return None;
+                    }
                     stream.recv_flow.inc_recv_window(increment).ok()?;
                 }
                 frame::Leading::WindowUpdate(frame::WindowUpdate::new(stream_id, increment))
@@ -1697,6 +1722,16 @@ impl Inner {
         };
         if relay.preface.took_latest() {
             return false;
+        }
+        // Its grants for an own window are for the data sent here, not the relayed peer's.
+        if let LoggedFrame::WindowUpdate { stream_id, .. } = frame {
+            if self
+                .store
+                .find_mut(&StreamId::from(stream_id))
+                .is_some_and(|stream| stream.own_window)
+            {
+                return false;
+            }
         }
         match &mut frame {
             LoggedFrame::WindowUpdate { stream_id, .. }
@@ -1952,6 +1987,10 @@ impl Inner {
                 // Server: we can't reset a stream before having received
                 // the request headers, so don't allow.
                 if !peer.is_server() {
+                    if self.counts.reset_forgotten(id) {
+                        tracing::trace!("recv_headers for reset stream={:?}, ignoring", id);
+                        return Ok(());
+                    }
                     // This may be response headers for a stream we've already
                     // forgotten about...
                     if self.actions.may_have_forgotten_stream(peer, id) {
@@ -2073,6 +2112,13 @@ impl Inner {
                     let sz = sz as WindowSize;
                     self.actions.recv.ignore_data(sz)?;
 
+                    return Ok(());
+                }
+
+                if self.counts.reset_forgotten(id) {
+                    tracing::trace!("recv_data for reset stream={:?}, ignoring", id);
+                    let sz = frame.flow_controlled_len() as WindowSize;
+                    self.actions.recv.ignore_data(sz)?;
                     return Ok(());
                 }
 
