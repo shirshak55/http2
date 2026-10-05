@@ -249,8 +249,8 @@ pub(crate) struct RelayedFrames {
 /// The PRIORITY_UPDATE frame type (RFC 9218).
 const PRIORITY_UPDATE: u8 = 0x10;
 
-/// How many PINGs sent for a relaying caller await acknowledgements at most: the oldest
-/// past them is taken for unanswered.
+/// How many PINGs sent for a relaying caller await acknowledgements at most: one more
+/// waits, and the frames queued after it, until an acknowledgement comes.
 const RELAYED_PINGS: usize = 1024;
 
 /// How many frames received await the caller relaying them, or relayed SETTINGS the
@@ -740,6 +740,9 @@ where
                 if me.awaits_held(&queued.frame, recorded) {
                     at += 1;
                     continue;
+                }
+                if me.holds_ping(&queued.frame) {
+                    break;
                 }
                 let queued = me.control.remove(at).expect("a frame is queued");
                 me.control_octets -= queued.frame.octets();
@@ -1583,6 +1586,9 @@ impl Inner {
                 at += 1;
                 continue;
             }
+            if self.holds_ping(&queued.frame) {
+                break;
+            }
             ready!(dst.poll_ready(cx))?;
             let queued = self.control.remove(at).expect("a frame is queued");
             self.control_octets -= queued.frame.octets();
@@ -1870,10 +1876,14 @@ impl Inner {
     /// Notes a PING carrying `payload` sent for a relaying caller, awaiting its
     /// acknowledgement.
     fn sent_relayed_ping(&mut self, payload: [u8; 8]) {
-        if self.relayed_pings.len() == RELAYED_PINGS {
-            self.relayed_pings.pop_front();
-        }
         self.relayed_pings.push_back(payload);
+    }
+
+    /// Whether `frame`, queued (see [`Queued`]), is a PING that waits, and the frames
+    /// queued after it, while as many sent for a relaying caller as may await
+    /// acknowledgements do (see [`RELAYED_PINGS`]).
+    fn holds_ping(&self, frame: &ControlFrame) -> bool {
+        matches!(frame, ControlFrame::Ping(_)) && self.relayed_pings.len() >= RELAYED_PINGS
     }
 
     /// The request, as recorded (see [`HeadersFrameOptions::recorded_stream_id`]), that went
