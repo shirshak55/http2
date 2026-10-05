@@ -22,8 +22,8 @@ use crate::{
     ext::{
         BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
         HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, OwnWindow,
-        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RefusePushes, ResponsePosition,
-        SendBodyLayout,
+        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RecordedStream, RefusePushes,
+        ResponsePosition, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -454,6 +454,7 @@ where
         let refuse_pushes = request.extensions_mut().remove::<RefusePushes>().is_some();
         let own_window = request.extensions_mut().remove::<OwnWindow>().is_some();
         let headers_frame = request.extensions_mut().remove::<HeadersFrameOptions>();
+        let recorded_stream = request.extensions_mut().remove::<RecordedStream>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -491,7 +492,8 @@ where
 
         let recorded = headers_frame
             .as_ref()
-            .and_then(|frame| frame.recorded_stream_id);
+            .and_then(|frame| frame.recorded_stream_id)
+            .or(recorded_stream.map(|RecordedStream(id)| id));
         let first_recorded = headers_frame
             .as_ref()
             .and_then(|frame| frame.first_recorded_stream_id);

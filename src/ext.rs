@@ -91,6 +91,16 @@ pub enum ResponsePosition {
 #[derive(Clone, Copy, Debug)]
 pub struct OwnWindow;
 
+/// The id the request's stream had on the connection it was recorded on, for a request
+/// whose HEADERS keep the connection's shape, carrying no [`HeadersFrameOptions`] (whose
+/// [`recorded_stream_id`](HeadersFrameOptions::recorded_stream_id) it stands for): the
+/// connection tells of the request by it (a GOAWAY's last stream, the requests it left
+/// unprocessed, where it came in their responses) and sends the frames following it (see
+/// [`Control::after_request`](crate::client::Control::after_request)) after it, while
+/// numbering its stream itself.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedStream(pub u32);
+
 /// The names of a message's header fields in the order its header block carries them,
 /// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
 ///
@@ -493,6 +503,32 @@ impl ReceivedPreface {
     /// doesn't get it.
     pub(crate) fn took_latest(&self) -> bool {
         self.lock().took_latest
+    }
+
+    /// Whether it is complete (see [`Self`]).
+    pub(crate) fn is_complete(&self) -> bool {
+        let inner = self.lock();
+        inner.complete
+            || inner.relayed
+                && inner
+                    .frames
+                    .iter()
+                    .any(|frame| matches!(frame, LoggedFrame::Settings { ack: false, .. }))
+    }
+
+    /// The value its SETTINGS frames gave the setting `id` last, if one did.
+    pub(crate) fn setting(&self, id: u16) -> Option<u32> {
+        self.lock()
+            .frames
+            .iter()
+            .filter_map(|frame| match frame {
+                LoggedFrame::Settings { ack: false, params } => Some(params),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(param, _)| *param == id)
+            .map(|(_, value)| *value)
+            .last()
     }
 
     /// Notes that a caller relays the frames past it (see [`Self`]).

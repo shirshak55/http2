@@ -55,6 +55,10 @@ pub enum UserError {
 
     /// A WINDOW_UPDATE increment is zero or would overflow the window.
     InvalidWindowUpdate,
+
+    /// Tries to send an extended CONNECT (`:protocol`) to a peer whose SETTINGS didn't
+    /// enable it (RFC 8441 §3).
+    PeerDisabledExtendedConnect,
 }
 
 // ===== impl SendError =====
@@ -105,6 +109,9 @@ impl fmt::Display for UserError {
             PeerDisabledServerPush => "sending PUSH_PROMISE to peer who disabled server push",
             InvalidInformationalStatusCode => "invalid informational status code",
             InvalidWindowUpdate => "invalid WINDOW_UPDATE increment",
+            PeerDisabledExtendedConnect => {
+                "sending an extended CONNECT to a peer whose SETTINGS didn't enable it"
+            }
         })
     }
 }

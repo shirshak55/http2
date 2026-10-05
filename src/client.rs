@@ -136,11 +136,13 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::{FrameLog, HeaderOrder, LoggedFrame, PrefaceFrame, Protocol, ReceivedPreface};
+use crate::ext::{
+    ExtendedConnect, FrameLog, HeaderOrder, LoggedFrame, PrefaceFrame, Protocol, ReceivedPreface,
+};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
-    Headers, Priorities, Priority, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder,
+    Headers, Priorities, Priority, Pseudo, PseudoOrder, Reason, SettingId, Settings, SettingsOrder,
     StreamDependency, StreamId, MAX_MAX_FRAME_SIZE,
 };
 use crate::proto::{self, Error};
@@ -815,6 +817,14 @@ where
         request: Request<()>,
         end_of_stream: bool,
     ) -> Result<(ResponseFuture, SendStream<B>), crate::Error> {
+        // RFC 8441 §3: not once the peer's SETTINGS are known not to enable it.
+        let extensions = request.extensions();
+        if (extensions.get::<Protocol>().is_some() || extensions.get::<ExtendedConnect>().is_some())
+            && self.preface.is_complete()
+            && !self.extended_connect_enabled()
+        {
+            return Err(UserError::PeerDisabledExtendedConnect.into());
+        }
         self.inner
             .send_request(request, end_of_stream, self.pending.as_ref())
             .map_err(Into::into)
@@ -847,6 +857,29 @@ where
     /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
     pub fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.inner.is_extended_connect_protocol_enabled()
+    }
+
+    /// Ready once the peer's connection preface arrived, or the connection ended (see
+    /// [`ReceivedPreface`]), with whether its SETTINGS enabled the [extended CONNECT
+    /// protocol][1]: a request carrying `:protocol` ([`Protocol`] or [`ExtendedConnect`])
+    /// waits for it, as [`Self::send_request`] fails one, unsent, once they are known not
+    /// to ([RFC 8441 §3][2]).
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn poll_extended_connect(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        ready!(Pin::new(&mut self.preface.clone()).poll(cx));
+        Poll::Ready(self.extended_connect_enabled())
+    }
+
+    /// Whether the peer's SETTINGS, applied or received so far, enabled the extended
+    /// CONNECT protocol.
+    fn extended_connect_enabled(&self) -> bool {
+        self.inner.is_extended_connect_protocol_enabled()
+            || self
+                .preface
+                .setting(SettingId::EnableConnectProtocol.into())
+                == Some(1)
     }
 
     /// Returns the current max send streams

@@ -114,6 +114,16 @@ impl Error {
             Kind::GoAway(_, _, Initiator::Library) | Kind::Reset(_, _, Initiator::Library)
         )
     }
+
+    /// Whether the request wasn't sent because it was an extended CONNECT (`:protocol`) and
+    /// the peer's SETTINGS didn't enable it (RFC 8441 §3; see
+    /// [`SendRequest::poll_extended_connect`](crate::client::SendRequest::poll_extended_connect)).
+    pub fn is_extended_connect_disabled(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::User(UserError::PeerDisabledExtendedConnect)
+        )
+    }
 }
 
 impl From<proto::Error> for Error {
