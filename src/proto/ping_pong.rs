@@ -94,6 +94,18 @@ impl PingPong {
         });
     }
 
+    /// Whether a PING of the connection's own, or its user's, carrying `payload` went out
+    /// and awaits its acknowledgement.
+    pub(crate) fn awaits_own_ack(&self, payload: &PingPayload) -> bool {
+        self.pending_ping
+            .as_ref()
+            .map_or(false, |ping| ping.sent && &ping.payload == payload)
+            || (payload == &Ping::USER
+                && self.user_pings.as_ref().map_or(false, |users| {
+                    users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PONG
+                }))
+    }
+
     /// Process a ping
     pub(crate) fn recv_ping(&mut self, ping: Ping) -> ReceivedPing {
         // The caller should always check that `send_pongs` returns ready before

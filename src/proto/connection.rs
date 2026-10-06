@@ -613,7 +613,12 @@ where
                     return Ok(ReceivedFrame::Continue);
                 }
                 // So is the acknowledgement of a relayed one.
-                if frame.is_ack() && self.streams.relay_ping_ack(*frame.payload()) {
+                if frame.is_ack()
+                    && self.streams.relay_ping_ack(
+                        *frame.payload(),
+                        self.ping_pong.awaits_own_ack(frame.payload()),
+                    )
+                {
                     return Ok(ReceivedFrame::Continue);
                 }
                 let status = self.ping_pong.recv_ping(frame);
@@ -636,9 +641,12 @@ where
                 self.streams.recv_window_update(frame)?;
                 self.streams.relay(logged);
             }
-            Some(Priority(_frame)) => {
-                tracing::trace!(?_frame, "recv PRIORITY");
-                // TODO: handle
+            Some(Priority(frame)) => {
+                tracing::trace!(?frame, "recv PRIORITY");
+                self.streams.relay(LoggedFrame::Priority {
+                    stream_id: frame.stream_id().into(),
+                    priority: frame.dependency().to_ext(),
+                });
             }
             Some(Unknown(frame)) => {
                 tracing::trace!(?frame, "recv unknown frame");

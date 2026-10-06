@@ -257,6 +257,8 @@ struct ReceivedBody {
     data_frames: u64,
     /// The DATA frames kept and not yet taken.
     frames: std::collections::VecDeque<DataFrame>,
+    /// Whether it dropped a DATA frame it had to keep (see [`BodyFrames::dropped`]).
+    dropped: bool,
     trailers: Option<HeaderBlockEncoding>,
 }
 
@@ -268,25 +270,38 @@ impl BodyFrames {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn push_data(&self, len: usize, padding: Option<u8>, end_stream: bool) {
+    /// Keeps a DATA frame received, as far as it holds room for it; whether it did, or
+    /// had no need to.
+    pub(crate) fn push_data(&self, len: usize, padding: Option<u8>, end_stream: bool) -> bool {
         let mut body = self.lock();
         let index = body.data_frames;
         if len > 0 {
             body.data_frames += 1;
         }
-        if (padding.is_some() || len == 0 || end_stream) && body.frames.len() < MAX_KEPT_DATA_FRAMES
-        {
-            body.frames.push_back(DataFrame {
-                index,
-                len,
-                padding,
-                end_stream,
-            });
+        if !(padding.is_some() || len == 0 || end_stream) {
+            return true;
         }
+        if body.frames.len() >= MAX_KEPT_DATA_FRAMES {
+            body.dropped = true;
+            return false;
+        }
+        body.frames.push_back(DataFrame {
+            index,
+            len,
+            padding,
+            end_stream,
+        });
+        true
     }
 
     pub(crate) fn set_trailers(&self, encoding: HeaderBlockEncoding) {
         self.lock().trailers = Some(encoding);
+    }
+
+    /// Whether it dropped a DATA frame it had to keep, already holding 1,024
+    /// untaken: a layout replayed from it misses that frame's padding or ending.
+    pub fn dropped(&self) -> bool {
+        self.lock().dropped
     }
 
     /// Removes and returns the DATA frames kept so far that went no later than the DATA

@@ -26,6 +26,13 @@ pub(super) struct Recv {
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
 
+    /// The padding of streams' frames that a WINDOW_UPDATE of the connection's own grows
+    /// its window by (see `Stream::unrelayed_padding`).
+    unrelayed_padding: WindowSize,
+
+    /// The DATA frames received that wait to be taken (see [`Recv::poll_buffered_room`]).
+    buffered_frames: usize,
+
     /// The task waiting for room among the data received (see [`Recv::poll_buffered_room`]).
     buffered_task: Option<Waker>,
 
@@ -88,6 +95,11 @@ pub(super) enum RecvHeaderBlockError<T> {
 /// caller passing the data on to a peer slower to take it would otherwise hold all of it.
 const BUFFERED_DATA: WindowSize = 16 << 20;
 
+/// How many DATA frames received a connection holds untaken before it reads no more
+/// frames (see [`Recv::poll_buffered_room`]): empty or small ones take memory their data
+/// doesn't count for.
+const BUFFERED_FRAMES: usize = 1 << 14;
+
 #[derive(Debug)]
 pub(crate) enum Open {
     PushPromise,
@@ -112,6 +124,8 @@ impl Recv {
             flow,
             stream_threshold: config.stream_window_threshold,
             in_flight_data: 0 as WindowSize,
+            unrelayed_padding: 0,
+            buffered_frames: 0,
             buffered_task: None,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
@@ -486,24 +500,40 @@ impl Recv {
         Ok(())
     }
 
-    /// Ready once the data received and not yet released is less than [`BUFFERED_DATA`].
+    /// Ready once the data received and not yet released is less than [`BUFFERED_DATA`],
+    /// and the DATA frames received and not yet taken fewer than [`BUFFERED_FRAMES`].
     pub fn poll_buffered_room(&mut self, cx: &Context) -> Poll<()> {
-        if self.in_flight_data < BUFFERED_DATA {
+        if self.has_buffered_room() {
             return Poll::Ready(());
         }
         self.buffered_task = Some(cx.waker().clone());
         Poll::Pending
     }
 
-    /// Counts `capacity` of the data received as released, waking the task waiting for room
-    /// among it.
-    fn release_in_flight(&mut self, capacity: WindowSize) {
-        self.in_flight_data -= capacity;
-        if self.in_flight_data < BUFFERED_DATA {
+    fn has_buffered_room(&self) -> bool {
+        self.in_flight_data < BUFFERED_DATA && self.buffered_frames < BUFFERED_FRAMES
+    }
+
+    /// Wakes the task waiting for room among the data received, once there is.
+    fn wake_buffered(&mut self) {
+        if self.has_buffered_room() {
             if let Some(task) = self.buffered_task.take() {
                 task.wake();
             }
         }
+    }
+
+    /// Counts `capacity` of the data received as released, waking the task waiting for room
+    /// among it.
+    fn release_in_flight(&mut self, capacity: WindowSize) {
+        self.in_flight_data -= capacity;
+        self.wake_buffered();
+    }
+
+    /// Counts a DATA frame received as taken, waking the task waiting for room among them.
+    fn take_buffered_frame(&mut self) {
+        self.buffered_frames -= 1;
+        self.wake_buffered();
     }
 
     /// Releases capacity of the connection
@@ -579,18 +609,16 @@ impl Recv {
     pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
         debug_assert_eq!(stream.ref_count, 0);
 
-        if stream.in_flight_recv_data == 0 {
-            return;
+        if stream.in_flight_recv_data != 0 {
+            tracing::trace!(
+                "auto-release closed stream ({:?}) capacity: {:?}",
+                stream.id,
+                stream.in_flight_recv_data,
+            );
+
+            self.release_connection_capacity(stream.in_flight_recv_data, task);
+            stream.in_flight_recv_data = 0;
         }
-
-        tracing::trace!(
-            "auto-release closed stream ({:?}) capacity: {:?}",
-            stream.id,
-            stream.in_flight_recv_data,
-        );
-
-        self.release_connection_capacity(stream.in_flight_recv_data, task);
-        stream.in_flight_recv_data = 0;
 
         self.clear_recv_buffer(stream);
     }
@@ -783,13 +811,13 @@ impl Recv {
 
         stream.data_received += frame.payload().len() as u64;
 
-        if let Some((_, body)) = &stream.received {
+        let recorded = stream.received.as_ref().map_or(true, |(_, body)| {
             body.push_data(
                 frame.payload().len(),
                 frame.pad_len(),
                 frame.is_end_stream(),
-            );
-        }
+            )
+        });
 
         // use payload len, padding doesn't count for content-length
         if stream.dec_content_length(frame.payload().len()).is_err() {
@@ -849,12 +877,20 @@ impl Recv {
             let _res = self.release_capacity(padding, stream, &mut None);
             // cannot fail, we JUST added more in_flight data above.
             debug_assert!(_res.is_ok());
+            // The body's frames didn't keep this one, so the relaying peer isn't sent its
+            // padding, nor grows the windows by it.
+            if !recorded && stream.recv_flow.is_mirror() {
+                stream.unrelayed_padding = stream.unrelayed_padding.saturating_add(padding);
+                self.unrelayed_padding = self.unrelayed_padding.saturating_add(padding);
+                self.pending_window_updates.push(stream);
+            }
         }
 
         let event = Event::Data(frame.into_payload());
 
         // Push the frame onto the recv buffer
         stream.pending_recv.push_back(&mut self.buffer, event);
+        self.buffered_frames += 1;
         stream.notify_recv();
 
         Ok(())
@@ -1042,8 +1078,10 @@ impl Recv {
     }
 
     pub(super) fn clear_recv_buffer(&mut self, stream: &mut Stream) {
-        while stream.pending_recv.pop_front(&mut self.buffer).is_some() {
-            // drop it
+        while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+            if let Event::Data(_) = event {
+                self.take_buffered_frame();
+            }
         }
     }
 
@@ -1232,6 +1270,15 @@ impl Recv {
                 .expect("unexpected flow control state");
         }
 
+        if self.unrelayed_padding != 0 {
+            ready!(dst.poll_ready(cx))?;
+            let incr = std::mem::take(&mut self.unrelayed_padding);
+            if self.flow.inc_recv_window(incr).is_ok() {
+                dst.buffer(frame::WindowUpdate::new(StreamId::zero(), incr).into())
+                    .expect("invalid WINDOW_UPDATE frame");
+            }
+        }
+
         Poll::Ready(Ok(()))
     }
 
@@ -1288,6 +1335,12 @@ impl Recv {
                         .recv_flow
                         .window_update_sent(incr)
                         .expect("unexpected flow control state");
+                } else if stream.unrelayed_padding != 0 {
+                    let incr = std::mem::take(&mut stream.unrelayed_padding);
+                    if stream.recv_flow.inc_recv_window(incr).is_ok() {
+                        dst.buffer(frame::WindowUpdate::new(stream.id, incr).into())
+                            .expect("invalid WINDOW_UPDATE frame");
+                    }
                 }
             })
         }
@@ -1303,7 +1356,10 @@ impl Recv {
         stream: &mut Stream,
     ) -> Poll<Option<Result<Bytes, proto::Error>>> {
         match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Data(payload)) => Poll::Ready(Some(Ok(payload))),
+            Some(Event::Data(payload)) => {
+                self.take_buffered_frame();
+                Poll::Ready(Some(Ok(payload)))
+            }
             Some(event) => {
                 // Frame is trailer
                 stream.pending_recv.push_front(&mut self.buffer, event);

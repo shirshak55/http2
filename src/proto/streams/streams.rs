@@ -932,17 +932,15 @@ impl<B> DynStreams<'_, B> {
     }
 
     /// Hands the peer's acknowledgement of a PING carrying `payload` sent for a relaying
-    /// caller (see [`Control::relay_received`]) to that caller; whether it was one.
-    pub fn relay_ping_ack(&mut self, payload: [u8; 8]) -> bool {
+    /// caller (see [`Control::relay_received`]) to that caller; whether it was one, rather
+    /// than of the connection's own, which `own` tells awaits one.
+    pub fn relay_ping_ack(&mut self, payload: [u8; 8], own: bool) -> bool {
         let mut me = self.inner.lock();
         match me.relayed_pings.iter().position(|sent| *sent == payload) {
             Some(at) => {
                 me.relayed_pings.remove(at);
             }
-            None if me.unrecorded_pings > 0
-                && payload != frame::Ping::USER
-                && payload != frame::Ping::SHUTDOWN =>
-            {
+            None if me.unrecorded_pings > 0 && !own => {
                 me.unrecorded_pings -= 1;
             }
             None => return false,
@@ -1848,6 +1846,28 @@ impl Inner {
                         tracing::debug!(
                             stream_id = *stream_id,
                             "frame on a stream of no recorded request"
+                        );
+                        return false;
+                    }
+                }
+            }
+            LoggedFrame::Priority {
+                stream_id,
+                priority,
+            } => {
+                let recorded = |id: u32| match id {
+                    0 => Some(0),
+                    id => self.recorded_request(StreamId::from(id)),
+                };
+                match (recorded(*stream_id), recorded(priority.dependency)) {
+                    (Some(recorded), Some(dependency)) => {
+                        *stream_id = recorded;
+                        priority.dependency = dependency;
+                    }
+                    _ => {
+                        tracing::debug!(
+                            stream_id = *stream_id,
+                            "PRIORITY about a stream of no recorded request"
                         );
                         return false;
                     }

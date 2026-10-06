@@ -990,7 +990,8 @@ impl EncodingHeaderBlock {
             Some(len) if !self.fragments.is_empty() => len.min(room),
             _ => room,
         };
-        let continuation = if self.hpack.len() > len {
+        // A block that fits goes on in the empty fragments recorded after it.
+        let continuation = if self.hpack.len() > len || self.fragments.front() == Some(&0) {
             dst.put((&mut self.hpack).take(len));
 
             Some(Continuation {
