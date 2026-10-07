@@ -3097,6 +3097,17 @@ impl<B> StreamRef<B> {
         }
     }
 
+    /// Resets the stream as [`Self::send_reset`] does, after the DATA it queued, as a reset
+    /// relayed from its client goes (see `Control::cancel_with`).
+    pub fn send_reset_after_data(&mut self, reason: Reason) {
+        {
+            let mut me = self.opaque.inner.lock();
+            let mut stream = me.store.resolve(self.opaque.key);
+            stream.cancel_reason.get_or_insert(reason);
+        }
+        self.send_reset(reason);
+    }
+
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock();
         let me = &mut *me;

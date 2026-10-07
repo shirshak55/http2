@@ -369,6 +369,16 @@ impl<B: Buf> SendStream<B> {
         self.inner.send_reset(reason)
     }
 
+    /// Resets the stream as [`send_reset`](Self::send_reset) does, but after the DATA it
+    /// queued, as far as that goes at once (all of it for `NO_ERROR`), as a reset relayed
+    /// from the request's client goes (see [`Control::cancel_with`]): for a body that
+    /// failed after what it sent, which the peer still gets.
+    ///
+    /// [`Control::cancel_with`]: crate::client::Control::cancel_with
+    pub fn send_reset_after_data(&mut self, reason: Reason) {
+        self.inner.send_reset_after_data(reason)
+    }
+
     /// Polls to be notified when the client resets this stream.
     ///
     /// If stream is still open, this returns `Poll::Pending`, and
