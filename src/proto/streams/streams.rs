@@ -3149,9 +3149,11 @@ impl<B> StreamRef<B> {
     /// `SendStream::on_sent`).
     pub fn on_sent(&mut self, sent: Box<dyn FnOnce() + std::marker::Send>) {
         let mut me = self.opaque.inner.lock();
+        let me = &mut *me;
         let mut stream = me.store.resolve(self.opaque.key);
-        stream.on_sent = Some(sent);
-        stream.notify_sent();
+        me.actions
+            .send
+            .on_sent(sent, &mut stream, &mut me.actions.task);
     }
 
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {

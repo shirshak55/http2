@@ -382,10 +382,10 @@ impl<B: Buf> SendStream<B> {
         self.inner.send_reset_after_data(reason)
     }
 
-    /// Calls `sent` once nothing the stream queued is still to go: at once if nothing is,
-    /// else once the last of it was written, or dropped as the stream was reset; should the
-    /// connection go first, `sent` is dropped uncalled. It is called with the connection's
-    /// state locked, so it must not use the connection.
+    /// Calls `sent` once nothing the stream queued is still to go: once the last of it was
+    /// written and flushed to the connection's transport, or dropped as the stream was reset;
+    /// should the connection go first, `sent` is dropped uncalled. It is called with the
+    /// connection's state locked, so it must not use the connection.
     pub fn on_sent(&mut self, sent: impl FnOnce() + Send + 'static) {
         self.inner.on_sent(Box::new(sent))
     }

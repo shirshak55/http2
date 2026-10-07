@@ -66,6 +66,17 @@ impl Send {
         self.prioritize.headers_sent()
     }
 
+    /// Calls `sent` once nothing `stream` queued is still to go (see `SendStream::on_sent`).
+    pub fn on_sent(
+        &mut self,
+        sent: Box<dyn FnOnce() + std::marker::Send>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        stream.on_sent = Some(sent);
+        self.prioritize.queue_sent(stream, task);
+    }
+
     /// Whether a stream waits for the peer to let it open (see `Prioritize::queue_open`).
     pub fn has_pending_open(&self) -> bool {
         self.prioritize.has_pending_open()

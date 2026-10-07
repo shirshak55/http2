@@ -433,16 +433,16 @@ impl Stream {
         }
     }
 
-    /// Calls `on_sent`, if any, once nothing it queued is still to go: its frames written,
-    /// or dropped.
-    pub fn notify_sent(&mut self) {
+    /// Takes `on_sent`, if any, once nothing it queued is still to go: its frames taken by
+    /// the codec, or dropped.
+    pub fn take_sent(&mut self) -> Option<Box<dyn FnOnce() + std::marker::Send>> {
         if self.pending_send.is_empty()
             && self.buffered_send_data == 0
             && !self.state.is_scheduled_reset()
         {
-            if let Some(sent) = self.on_sent.take() {
-                sent();
-            }
+            self.on_sent.take()
+        } else {
+            None
         }
     }
 

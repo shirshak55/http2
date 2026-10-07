@@ -72,6 +72,19 @@ pub(super) struct Prioritize {
     /// The peer's relayed SETTINGS frames a HEADERS just written acknowledged, to apply
     /// before any frame after it goes (see `Self::take_relayed_acked`).
     relayed_acked: Vec<frame::Settings>,
+
+    /// The `on_sent` callbacks of the streams whose frames all went to the codec, called
+    /// once it flushed them to the transport (see `SendStream::on_sent`).
+    flushed: OnFlushed,
+}
+
+#[derive(Default)]
+struct OnFlushed(Vec<Box<dyn FnOnce() + std::marker::Send>>);
+
+impl fmt::Debug for OnFlushed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("OnFlushed").field(&self.0.len()).finish()
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -121,6 +134,26 @@ impl Prioritize {
             max_buffer_size: config.local_max_buffer_size,
             data_sent: 0,
             relayed_acked: Vec::new(),
+            flushed: OnFlushed::default(),
+        }
+    }
+
+    /// Holds `stream`'s `on_sent` callback, once nothing it queued is still to go, until the
+    /// codec flushed what it took (see `poll_complete`); whether it did.
+    fn hold_sent(&mut self, stream: &mut store::Ptr) -> bool {
+        let Some(sent) = stream.take_sent() else {
+            return false;
+        };
+        self.flushed.0.push(sent);
+        true
+    }
+
+    /// [`Self::hold_sent`], waking the connection (`task`) to flush the codec.
+    pub fn queue_sent(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+        if self.hold_sent(stream) {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
         }
     }
 
@@ -662,6 +695,10 @@ impl Prioritize {
                     // Try to flush the codec.
                     ready!(dst.flush(cx))?;
 
+                    for sent in self.flushed.0.drain(..) {
+                        sent();
+                    }
+
                     // This might release a data frame...
                     if !self.reclaim_frame(buffer, store, dst) {
                         return Poll::Ready(Ok(()));
@@ -794,7 +831,7 @@ impl Prioritize {
                 stream.sending_planned = false;
             }
         }
-        stream.notify_sent();
+        self.hold_sent(stream);
     }
 
     /// Drops the frames `stream` queued ahead of its RST_STREAM, which can't go at once
@@ -1155,7 +1192,7 @@ impl Prioritize {
                         // any more capacity.
                         self.pending_send.push(&mut stream);
                     }
-                    stream.notify_sent();
+                    self.hold_sent(&mut stream);
 
                     counts.transition_after(stream, is_pending_reset);
 
