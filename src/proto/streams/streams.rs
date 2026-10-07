@@ -1425,12 +1425,15 @@ impl Control {
         self.inner.lock().error_hook = Some(ErrorHook(Box::new(error)));
     }
 
-    /// Resolves once the frames queued (see [`Queued`]) went out on the transport, or the
+    /// Resolves once the frames queued (see [`Queued`]) went out on the transport, and the
+    /// requests on their way here (see [`Self::expect_request`]) were sent here, or the
     /// connection ended.
     pub(crate) async fn sent(&self) {
         std::future::poll_fn(|cx| {
             let mut me = self.inner.lock();
-            if (me.control.is_empty() && !me.control_unflushed) || me.actions.conn_error.is_some() {
+            if (me.control.is_empty() && !me.control_unflushed && me.expected.is_empty())
+                || me.actions.conn_error.is_some()
+            {
                 return Poll::Ready(());
             }
             me.sent_tasks.push(cx.waker().clone());

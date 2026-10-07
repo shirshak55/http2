@@ -460,7 +460,8 @@ impl Control {
     }
 
     /// Resolves once the frames sent through this connection's handles went out on its
-    /// transport, or the connection ended.
+    /// transport, and the requests on their way to it (see [`Self::expect_request`]) reached
+    /// it, or the connection ended.
     pub async fn sent(&self) {
         self.inner.sent().await;
     }
