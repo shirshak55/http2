@@ -231,6 +231,12 @@ pub trait BodyLayout: Send + Sync {
     fn padding_unsent(&self, octets: usize) {
         let _ = octets;
     }
+
+    /// Tells that the body went no further than `octets` of flow-controlled data, its
+    /// END_STREAM sent or its stream reset: none of the rest goes.
+    fn sent(&self, octets: u64) {
+        let _ = octets;
+    }
 }
 
 /// How a response went on the wire: its header block, and its body, kept as it arrives.

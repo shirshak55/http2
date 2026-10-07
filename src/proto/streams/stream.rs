@@ -149,6 +149,9 @@ pub(super) struct Stream {
     /// The DATA frames `body_layout` told of that its body didn't reach yet
     pub body_frames: std::collections::VecDeque<crate::ext::DataFrame>,
 
+    /// The flow-controlled octets of the DATA frames that went on it so far
+    pub data_sent: u64,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -260,6 +263,7 @@ impl Stream {
             body_layout: None,
             body_chunks: 0,
             body_frames: std::collections::VecDeque::new(),
+            data_sent: 0,
             content_length: ContentLength::Omitted,
             sent_headers: None,
             received: None,
@@ -414,6 +418,14 @@ impl Stream {
         self.data_taken += u64::from(octets);
         if self.recv_flow.is_mirror() {
             self.mirrored_taken += u64::from(octets);
+        }
+    }
+
+    /// Tells its body's layout, if any, that the rest of its body doesn't go (see
+    /// `ext::BodyLayout::sent`).
+    pub fn end_layout(&self) {
+        if let Some(layout) = &self.body_layout {
+            layout.sent(self.data_sent);
         }
     }
 

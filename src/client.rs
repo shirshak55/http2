@@ -426,6 +426,14 @@ impl Control {
         self.inner.leave_close_to_caller();
     }
 
+    /// Has the requests dropped, or whose bodies fail (see
+    /// [`SendStream::send_reset_after_data`]), from now on end with the connection rather
+    /// than each be reset, as those of a client relaying another's end do: only those
+    /// [`Self::cancel_with`] reset as their client did are.
+    pub fn end_streams_with_connection(&self) {
+        self.inner.end_streams_with_connection();
+    }
+
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as the
     /// connection requests were recorded on numbered it (see
     /// [`recorded_stream_id`](crate::ext::HeadersFrameOptions::recorded_stream_id)), as the

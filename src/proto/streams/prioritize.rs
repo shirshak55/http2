@@ -426,6 +426,7 @@ impl Prioritize {
                 let _res = self.flow.send_data(len);
                 debug_assert!(_res.is_ok());
                 self.data_sent += u64::from(len);
+                stream.data_sent += u64::from(len);
             } else {
                 if let Some(layout) = &stream.body_layout {
                     layout.padding_unsent(len as usize);
@@ -783,6 +784,7 @@ impl Prioritize {
             tracing::trace!(?_frame, "dropping");
         }
 
+        stream.end_layout();
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
@@ -809,6 +811,7 @@ impl Prioritize {
             }
             tracing::trace!(?frame, "dropping");
         }
+        stream.end_layout();
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
         stream.sending_planned = false;
@@ -1035,6 +1038,7 @@ impl Prioritize {
                                 let _res = self.flow.send_data(flow_len);
                                 debug_assert!(_res.is_ok());
                                 self.data_sent += u64::from(flow_len);
+                                stream.data_sent += u64::from(flow_len);
 
                                 // Wrap the frame's data payload to ensure that the
                                 // correct amount of data gets written.
@@ -1061,6 +1065,9 @@ impl Prioritize {
                                     frame.set_end_stream(false);
                                 }
                                 frame.set_padding(padding);
+                                if frame.is_end_stream() {
+                                    stream.end_layout();
+                                }
                                 (eos, len)
                             };
 
@@ -1093,6 +1100,11 @@ impl Prioritize {
                             } else {
                                 stream.following = stream.following.saturating_sub(1);
                             }
+                            if matches!(&frame, Frame::Headers(headers) if headers.is_end_stream())
+                                || matches!(frame, Frame::Reset(_))
+                            {
+                                stream.end_layout();
+                            }
                             frame.map(|_| {
                                 unreachable!(
                                     "Frame::map closure will only be called \
@@ -1103,6 +1115,7 @@ impl Prioritize {
                         None => {
                             if let Some(reason) = stream.state.get_scheduled_reset() {
                                 stream.set_reset(reason, Initiator::Library);
+                                stream.end_layout();
 
                                 let frame = frame::Reset::new(stream.id, reason);
                                 Frame::Reset(frame)

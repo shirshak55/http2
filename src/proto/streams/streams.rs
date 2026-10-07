@@ -147,6 +147,10 @@ struct Inner {
     /// [`Control::leave_close_to_caller`])
     leaves_close: bool,
 
+    /// Whether the streams dropped end with the connection rather than being reset (see
+    /// [`Control::end_streams_with_connection`])
+    ends_streams: bool,
+
     /// Called with each GOAWAY the peer sends (see [`Control::on_go_away`])
     go_away_hook: Option<GoAwayHook>,
 
@@ -1284,8 +1288,11 @@ impl Control {
         let me = &mut *me;
         if let Some(mut stream) = me.store.find_mut(&id) {
             stream.cancel_reason = Some(reason);
-            // Its body, which would end with the reset, ended already.
-            if stream.state.is_send_closed() && !stream.state.is_closed() {
+            // Its body, which would end with the reset, ended already, or its handles,
+            // dropped, leave it to end with the connection.
+            if (stream.state.is_send_closed() || (me.ends_streams && stream.ref_count == 0))
+                && !stream.state.is_closed()
+            {
                 me.resets.push(id);
                 if let Some(task) = me.actions.task.take() {
                     task.wake();
@@ -1387,6 +1394,12 @@ impl Control {
     /// open past the peer's until the peer closes it or its handles are dropped.
     pub(crate) fn leave_close_to_caller(&self) {
         self.inner.lock().leaves_close = true;
+    }
+
+    /// Has the streams dropped, or whose bodies fail, from now on end with the connection
+    /// rather than be reset, but for those [`Self::cancel_with`] gave a reason.
+    pub(crate) fn end_streams_with_connection(&self) {
+        self.inner.lock().ends_streams = true;
     }
 
     /// Calls `go_away` with each GOAWAY the peer sends: its last stream, numbered as
@@ -2110,6 +2123,7 @@ impl Inner {
             resets: Vec::new(),
             went_away: false,
             leaves_close: false,
+            ends_streams: false,
             go_away_hook: None,
             error_hook: None,
             control_unflushed: false,
@@ -3121,7 +3135,11 @@ impl<B> StreamRef<B> {
     pub fn send_reset_after_data(&mut self, reason: Reason) {
         {
             let mut me = self.opaque.inner.lock();
+            let ends_streams = me.ends_streams;
             let mut stream = me.store.resolve(self.opaque.key);
+            if ends_streams && stream.cancel_reason.is_none() {
+                return;
+            }
             stream.cancel_reason.get_or_insert(reason);
         }
         self.send_reset(reason);
@@ -3536,6 +3554,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     stream.ref_dec();
 
     let actions = &mut me.actions;
+    let ends_streams = me.ends_streams;
 
     // If the stream is not referenced and it is already
     // closed (does not have to go through logic below
@@ -3548,7 +3567,9 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     }
 
     me.counts.transition(stream, |counts, stream| {
-        maybe_cancel(stream, actions, counts);
+        if !ends_streams || stream.cancel_reason.is_some() {
+            maybe_cancel(stream, actions, counts);
+        }
 
         if stream.ref_count == 0 {
             // Release any recv window back to connection, no one can access

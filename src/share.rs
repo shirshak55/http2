@@ -372,9 +372,12 @@ impl<B: Buf> SendStream<B> {
     /// Resets the stream as [`send_reset`](Self::send_reset) does, but after the DATA it
     /// queued, as far as that goes at once (all of it for `NO_ERROR`), as a reset relayed
     /// from the request's client goes (see [`Control::cancel_with`]): for a body that
-    /// failed after what it sent, which the peer still gets.
+    /// failed after what it sent, which the peer still gets. Once its streams end with the
+    /// connection (see [`Control::end_streams_with_connection`]), only one its client reset
+    /// is.
     ///
     /// [`Control::cancel_with`]: crate::client::Control::cancel_with
+    /// [`Control::end_streams_with_connection`]: crate::client::Control::end_streams_with_connection
     pub fn send_reset_after_data(&mut self, reason: Reason) {
         self.inner.send_reset_after_data(reason)
     }
