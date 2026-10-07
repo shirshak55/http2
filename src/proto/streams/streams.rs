@@ -1268,8 +1268,8 @@ impl Control {
 
     /// Makes the request recorded as `recorded`, if sent here, reset with `reason` rather
     /// than its own should its handles be dropped before it ends or reset it, at once if it
-    /// went out whole; if sent here later, reset so as it goes out when it has no body (see
-    /// [`Self::send_request`]).
+    /// went out whole, else once it does (see `StreamRef::send_data`); if sent here later,
+    /// reset so as it goes out when it has no body (see [`Self::send_request`]).
     pub(crate) fn cancel_with(&self, recorded: u32, reason: Reason) {
         let mut me = self.inner.lock();
         let Some(id) = me.opened_stream(recorded) else {
@@ -1570,6 +1570,24 @@ fn leading_frame<B>(frame: frame::Leading) -> Frame<B> {
 }
 
 impl Inner {
+    /// Resets the stream `key` refers to, whose request just ended, as its client reset it
+    /// before then (see [`Control::cancel_with`]): the client's reset followed its end. A
+    /// stream its response ended already is left closed.
+    fn reset_as_client_did<B>(&mut self, key: store::Key, send_buffer: &mut Buffer<Frame<B>>) {
+        let stream = self.store.resolve(key);
+        if let (Some(reason), false) = (stream.cancel_reason, stream.state.is_closed()) {
+            if let Err(crate::proto::error::GoAway { .. }) = self.actions.send_reset(
+                stream,
+                reason,
+                Initiator::User,
+                &mut self.counts,
+                send_buffer,
+            ) {
+                unreachable!("Initiator::User should not error sending reset");
+            }
+        }
+    }
+
     /// Writes the queued frames (see [`Queued`]) whose turn came, in order, the relayed
     /// SETTINGS an acknowledgement among them acknowledges applying as it goes.
     fn poll_control<T, B>(
@@ -3023,7 +3041,11 @@ impl<B> StreamRef<B> {
             actions
                 .send
                 .send_data(frame, send_buffer, stream, counts, &mut actions.task)
-        })
+        })?;
+        if end_stream {
+            me.reset_as_client_did(self.opaque.key, send_buffer);
+        }
+        Ok(())
     }
 
     pub fn send_trailers(
@@ -3069,7 +3091,9 @@ impl<B> StreamRef<B> {
             actions
                 .send
                 .send_trailers(frame, send_buffer, stream, counts, &mut actions.task)
-        })
+        })?;
+        me.reset_as_client_did(self.opaque.key, send_buffer);
+        Ok(())
     }
 
     pub fn send_reset(&mut self, reason: Reason) {
