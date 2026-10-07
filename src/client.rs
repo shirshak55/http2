@@ -461,7 +461,7 @@ impl Control {
     /// the connection's for the data it receives, grow only by the WINDOW_UPDATEs
     /// [`Self::send_window_update`] sends, those of a peer that data is relayed to, rather
     /// than by the data released. Data released otherwise, or never, as a stream closes,
-    /// still grows them.
+    /// still grows them, the connection's from then on announced at once.
     pub fn mirror_stream_window(&self, recorded: u32) {
         self.inner.mirror_stream_window(recorded);
     }

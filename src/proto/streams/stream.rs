@@ -94,6 +94,11 @@ pub(super) struct Stream {
     /// relaying peer isn't sent, which a WINDOW_UPDATE of the connection's own grows it by.
     pub unrelayed_padding: WindowSize,
 
+    /// The padding of the frames received while the window didn't grow only by relayed
+    /// WINDOW_UPDATEs that are not yet taken, which taking each releases: should the window
+    /// come to, the relaying peer, sent those frames' padding, grows the windows by it.
+    pub held_padding: WindowSize,
+
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
 
@@ -236,6 +241,7 @@ impl Stream {
             recv_flow,
             in_flight_recv_data: 0,
             unrelayed_padding: 0,
+            held_padding: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,

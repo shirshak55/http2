@@ -103,6 +103,28 @@ impl Store {
         })
     }
 
+    /// The stream `id`, as [`Self::find_mut`] finds it, or closed while its handles still
+    /// hold it, as a response's stream is until its body is taken.
+    pub fn find_held_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
+        let index = match self.ids.get(id) {
+            Some(index) => *index,
+            None => SlabIndex(
+                self.slab
+                    .iter()
+                    .find(|(_, stream)| stream.id == *id)
+                    .map(|(index, _)| index)? as u32,
+            ),
+        };
+
+        Some(Ptr {
+            key: Key {
+                index,
+                stream_id: *id,
+            },
+            store: self,
+        })
+    }
+
     /// The stream `id`, if open, or still sending, here.
     pub fn find(&self, id: &StreamId) -> Option<&Stream> {
         self.ids.get(id).map(|index| &self.slab[index.0 as usize])

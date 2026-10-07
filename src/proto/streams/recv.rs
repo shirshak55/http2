@@ -79,7 +79,8 @@ pub(super) struct Recv {
 #[derive(Debug)]
 pub(super) enum Event {
     Headers(peer::PollMessage),
-    Data(Bytes),
+    /// A DATA frame's data, and its padding held (see `Stream::held_padding`).
+    Data(Bytes, WindowSize),
     Trailers(HeaderMap, HeaderOrder),
     InformationalHeaders(peer::PollMessage),
 }
@@ -164,6 +165,18 @@ impl Recv {
         }
         self.flow = flow;
         Ok(())
+    }
+
+    /// Has the connection announce the window it gives itself as soon as it does, rather
+    /// than once enough of it is unclaimed: a stream's window grows only by relayed
+    /// WINDOW_UPDATEs, and data released otherwise may not come to make up the rest.
+    pub fn announce_window_at_once(&mut self, task: &mut Option<Waker>) {
+        self.flow.set_threshold(Some(1));
+        if self.flow.unclaimed_capacity(self.in_flight_data).is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
     }
 
     /// Returns the ID of the last processed stream
@@ -868,7 +881,15 @@ impl Recv {
         // Auto-release padding overhead (pad_len field + padding bytes),
         // since the user only sees the data payload via `payload()`.
         let padding = (frame.flow_controlled_len() - frame.payload().len()) as WindowSize;
-        if padding > 0 {
+        // That of a frame the body's frames kept waits for its taking while the window
+        // doesn't grow only by relayed WINDOW_UPDATEs, which may yet come to grow it by that.
+        let held = if recorded && !stream.recv_flow.is_mirror() {
+            padding
+        } else {
+            0
+        };
+        stream.held_padding += held;
+        if padding > held {
             tracing::trace!(
                 "recv_data; auto-releasing padding of {:?} for {:?}",
                 padding,
@@ -886,7 +907,7 @@ impl Recv {
             }
         }
 
-        let event = Event::Data(frame.into_payload());
+        let event = Event::Data(frame.into_payload(), held);
 
         // Push the frame onto the recv buffer
         stream.pending_recv.push_back(&mut self.buffer, event);
@@ -1079,7 +1100,7 @@ impl Recv {
 
     pub(super) fn clear_recv_buffer(&mut self, stream: &mut Stream) {
         while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
-            if let Event::Data(_) = event {
+            if let Event::Data(..) = event {
                 self.take_buffered_frame();
             }
         }
@@ -1353,11 +1374,20 @@ impl Recv {
     pub fn poll_data(
         &mut self,
         cx: &Context,
-        stream: &mut Stream,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
     ) -> Poll<Option<Result<Bytes, proto::Error>>> {
         match stream.pending_recv.pop_front(&mut self.buffer) {
-            Some(Event::Data(payload)) => {
+            Some(Event::Data(payload, padding)) => {
                 self.take_buffered_frame();
+                // Its padding goes now, unless the window came to grow only by relayed
+                // WINDOW_UPDATEs since.
+                let padding = padding.min(stream.held_padding);
+                if padding != 0 {
+                    stream.held_padding -= padding;
+                    let _res = self.release_capacity(padding, stream, task);
+                    debug_assert!(_res.is_ok());
+                }
                 Poll::Ready(Some(Ok(payload)))
             }
             Some(event) => {

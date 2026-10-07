@@ -1484,11 +1484,23 @@ impl Control {
     /// does for the data it receives (see [`FlowControl::set_mirror`]).
     pub(crate) fn mirror_stream_window(&self, recorded: u32) {
         let mut me = self.inner.lock();
+        let me = &mut *me;
         let Some(stream_id) = me.opened_stream(recorded) else {
             return;
         };
-        if let Some(mut stream) = me.store.find_mut(&stream_id) {
+        // A response received whole closed its stream, whose data may not be taken yet.
+        if let Some(mut stream) = me.store.find_held_mut(&stream_id) {
             stream.recv_flow.set_mirror();
+            // The relaying peer is sent the padding of the frames not yet taken.
+            let padding = std::mem::take(&mut stream.held_padding);
+            let _res = me
+                .actions
+                .recv
+                .release_capacity(padding, &mut stream, &mut me.actions.task);
+            debug_assert!(_res.is_ok());
+            me.actions
+                .recv
+                .announce_window_at_once(&mut me.actions.task);
         }
     }
 
@@ -1500,7 +1512,7 @@ impl Control {
             return false;
         };
         me.store
-            .find_mut(&stream_id)
+            .find_held_mut(&stream_id)
             .map_or(false, |stream| stream.body_layout.is_some())
     }
 
@@ -3374,7 +3386,9 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_data(cx, &mut stream)
+        me.actions
+            .recv
+            .poll_data(cx, &mut stream, &mut me.actions.task)
     }
 
     pub fn poll_trailers(
