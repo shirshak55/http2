@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::UserError;
-use crate::ext::HeaderOrder;
+use crate::ext::{GiveBack, HeaderOrder};
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
 use crate::tracing;
@@ -619,7 +619,12 @@ impl Recv {
     }
 
     /// Release any unclaimed capacity for a closed stream.
-    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+    pub fn release_closed_capacity(
+        &mut self,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+        give_back: impl FnOnce() -> GiveBack,
+    ) {
         debug_assert_eq!(stream.ref_count, 0);
 
         if stream.in_flight_recv_data != 0 {
@@ -634,35 +639,41 @@ impl Recv {
         }
 
         // The data taken that the relaying peer, resetting the stream it went on, wasn't sent
-        // grows the connection's window here, its WINDOW_UPDATEs never growing it by that.
-        if let Some(sent) = stream
-            .received
-            .as_ref()
-            .and_then(|(_, body)| body.relay_sent())
-        {
-            let unsent = stream
-                .data_taken
-                .saturating_sub(sent)
-                .min(stream.mirrored_taken)
-                .min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
-            stream.mirrored_taken = 0;
-            if unsent != 0 {
-                tracing::trace!(
-                    "auto-release closed stream ({:?}) unsent: {:?}",
-                    stream.id,
-                    unsent
-                );
-                let _res = self.flow.assign_capacity(unsent);
-                debug_assert!(_res.is_ok());
-                if self.flow.unclaimed_capacity(self.in_flight_data).is_some() {
-                    if let Some(task) = task.take() {
-                        task.wake();
-                    }
+        // grows the connection's window here, its WINDOW_UPDATEs never growing it by that:
+        // at once should that reset have come, else as it comes (`give_back`).
+        if stream.mirrored_taken != 0 {
+            if let Some((_, body)) = &stream.received {
+                let unsent = body.refund(stream.data_taken, stream.mirrored_taken, give_back);
+                stream.mirrored_taken = 0;
+                if let Some(unsent) = unsent {
+                    tracing::trace!(
+                        "auto-release closed stream ({:?}) unsent: {:?}",
+                        stream.id,
+                        unsent
+                    );
+                    self.give_back(unsent, task);
                 }
             }
         }
 
         self.clear_recv_buffer(stream);
+    }
+
+    /// Grows the connection's window by `octets` of data a mirrored stream took that the
+    /// relaying peer, resetting the stream it went on, wasn't sent (see
+    /// `BodyFrames::relay_reset`).
+    pub fn give_back(&mut self, octets: u64, task: &mut Option<Waker>) {
+        let octets = octets.min(u64::from(MAX_WINDOW_SIZE)) as WindowSize;
+        if octets == 0 {
+            return;
+        }
+        let _res = self.flow.assign_capacity(octets);
+        debug_assert!(_res.is_ok());
+        if self.flow.unclaimed_capacity(self.in_flight_data).is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
     }
 
     /// Set the "target" connection window size.

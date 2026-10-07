@@ -152,6 +152,9 @@ pub(super) struct Stream {
     /// The flow-controlled octets of the DATA frames that went on it so far
     pub data_sent: u64,
 
+    /// Called once nothing it queued is still to go (see `SendStream::on_sent`)
+    pub on_sent: Option<Box<dyn FnOnce() + std::marker::Send>>,
+
     /// Validate content-length headers
     pub content_length: ContentLength,
 
@@ -264,6 +267,7 @@ impl Stream {
             body_chunks: 0,
             body_frames: std::collections::VecDeque::new(),
             data_sent: 0,
+            on_sent: None,
             content_length: ContentLength::Omitted,
             sent_headers: None,
             received: None,
@@ -426,6 +430,19 @@ impl Stream {
     pub fn end_layout(&self) {
         if let Some(layout) = &self.body_layout {
             layout.sent(self.data_sent);
+        }
+    }
+
+    /// Calls `on_sent`, if any, once nothing it queued is still to go: its frames written,
+    /// or dropped.
+    pub fn notify_sent(&mut self) {
+        if self.pending_send.is_empty()
+            && self.buffered_send_data == 0
+            && !self.state.is_scheduled_reset()
+        {
+            if let Some(sent) = self.on_sent.take() {
+                sent();
+            }
         }
     }
 

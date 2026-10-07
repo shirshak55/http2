@@ -269,6 +269,27 @@ struct ReceivedBody {
     /// The flow-controlled octets the stream it was relayed on carried before its reset
     /// (see [`BodyFrames::relay_reset`]).
     relay_sent: Option<u64>,
+    /// What the stream it arrived on, released before that reset, gives back once it comes.
+    refund: Option<Refund>,
+}
+
+/// The data a mirrored stream took, `taken`, `mirrored` of it while mirrored, released
+/// before how far its body went on was told, and how to give back to its connection's
+/// receive window what of it the relaying peer wasn't sent, once told.
+#[derive(Debug)]
+struct Refund {
+    taken: u64,
+    mirrored: u64,
+    give_back: GiveBack,
+}
+
+/// Grows a connection's receive window by the octets it is given.
+pub(crate) struct GiveBack(pub(crate) Box<dyn FnOnce(u64) + Send>);
+
+impl fmt::Debug for GiveBack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("GiveBack(..)")
+    }
 }
 
 /// The most DATA frames a [`BodyFrames`] holds untaken; it drops any more.
@@ -332,13 +353,44 @@ impl BodyFrames {
     /// Tells that the stream the body was relayed on was reset once `sent` octets of
     /// flow-controlled data went on it: the data taken past those, which its peer never
     /// grants, grows the connection's receive window once the body's stream goes, as the
-    /// data never taken does.
+    /// data never taken does, or now, should it have gone already.
     pub fn relay_reset(&self, sent: u64) {
-        self.lock().relay_sent = Some(sent);
+        let refund = {
+            let mut body = self.lock();
+            body.relay_sent = Some(sent);
+            body.refund.take()
+        };
+        if let Some(Refund {
+            taken,
+            mirrored,
+            give_back,
+        }) = refund
+        {
+            (give_back.0)(taken.saturating_sub(sent).min(mirrored));
+        }
     }
 
-    pub(crate) fn relay_sent(&self) -> Option<u64> {
-        self.lock().relay_sent
+    /// The data its stream, gone having taken `taken` octets, `mirrored` of them while
+    /// mirrored, gives back as the relaying peer wasn't sent it, once
+    /// [`Self::relay_reset`] told how far the body went; until then `give_back` holds it.
+    pub(crate) fn refund(
+        &self,
+        taken: u64,
+        mirrored: u64,
+        give_back: impl FnOnce() -> GiveBack,
+    ) -> Option<u64> {
+        let mut body = self.lock();
+        match body.relay_sent {
+            Some(sent) => Some(taken.saturating_sub(sent).min(mirrored)),
+            None => {
+                body.refund = Some(Refund {
+                    taken,
+                    mirrored,
+                    give_back: give_back(),
+                });
+                None
+            }
+        }
     }
 }
 

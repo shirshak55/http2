@@ -23,10 +23,10 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::{
-        BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, HeaderBlockEncoding,
-        HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo, OwnWindow,
-        PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse, RecordedStream, RefusePushes,
-        ResponsePosition, SendBodyLayout,
+        BodyLayout, DataFrame, ExtendedConnect, FollowingFrame, FrameLog, GiveBack,
+        HeaderBlockEncoding, HeaderOrder, HeadersFrame, HeadersFrameOptions, LoggedFrame,
+        NeverIndexedPseudo, OwnWindow, PrefaceFrame, Protocol, ReceivedPreface, ReceivedResponse,
+        RecordedStream, RefusePushes, ResponsePosition, SendBodyLayout,
     },
     frame::{self, Frame, Reason},
     proto,
@@ -3145,6 +3145,15 @@ impl<B> StreamRef<B> {
         self.send_reset(reason);
     }
 
+    /// Calls `sent` once nothing the stream queued is still to go (see
+    /// `SendStream::on_sent`).
+    pub fn on_sent(&mut self, sent: Box<dyn FnOnce() + std::marker::Send>) {
+        let mut me = self.opaque.inner.lock();
+        let mut stream = me.store.resolve(self.opaque.key);
+        stream.on_sent = Some(sent);
+        stream.notify_sent();
+    }
+
     pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock();
         let me = &mut *me;
@@ -3541,7 +3550,7 @@ impl Drop for OpaqueStreamRef {
 }
 
 // TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+fn drop_stream_ref(inner: &Arc<Mutex<Inner>>, key: store::Key) {
     let mut me = inner.lock();
 
     let me = &mut *me;
@@ -3576,7 +3585,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task);
+                .release_closed_capacity(stream, &mut actions.task, || give_back(inner));
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();
@@ -3587,6 +3596,19 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             }
         }
     });
+}
+
+/// Grows the receive window of `inner`'s connection, while it lives, by the octets given
+/// (see `BodyFrames::relay_reset`).
+fn give_back(inner: &Arc<Mutex<Inner>>) -> GiveBack {
+    let inner = Arc::downgrade(inner);
+    GiveBack(Box::new(move |octets| {
+        if let Some(inner) = inner.upgrade() {
+            let mut me = inner.lock();
+            let me = &mut *me;
+            me.actions.recv.give_back(octets, &mut me.actions.task);
+        }
+    }))
 }
 
 fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {

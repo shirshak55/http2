@@ -794,6 +794,7 @@ impl Prioritize {
                 stream.sending_planned = false;
             }
         }
+        stream.notify_sent();
     }
 
     /// Drops the frames `stream` queued ahead of its RST_STREAM, which can't go at once
@@ -1154,6 +1155,7 @@ impl Prioritize {
                         // any more capacity.
                         self.pending_send.push(&mut stream);
                     }
+                    stream.notify_sent();
 
                     counts.transition_after(stream, is_pending_reset);
 
