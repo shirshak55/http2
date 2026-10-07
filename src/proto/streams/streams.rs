@@ -721,11 +721,13 @@ where
             leading_frames.push(frame::Leading::Settings(frame::Settings::ack()));
         }
         if let Some(recorded) = recorded {
-            // Only closed streams' entries go, oldest first: an open one's frames need its.
+            // Only released streams' entries go, oldest first: an open one's frames need its,
+            // and a closed one's body yet to be taken its mirroring (see
+            // `Control::mirror_stream_window`).
             let mut excess = (me.recorded_streams.len() + 1).saturating_sub(RECORDED_STREAMS);
             let store = &me.store;
             me.recorded_streams.retain(|(_, opened)| {
-                let evicted = excess > 0 && !store.contains(opened);
+                let evicted = excess > 0 && !store.holds(opened);
                 excess -= usize::from(evicted);
                 !evicted
             });
@@ -1491,13 +1493,6 @@ impl Control {
         // A response received whole closed its stream, whose data may not be taken yet.
         if let Some(mut stream) = me.store.find_held_mut(&stream_id) {
             stream.recv_flow.set_mirror();
-            // The relaying peer is sent the padding of the frames not yet taken.
-            let padding = std::mem::take(&mut stream.held_padding);
-            let _res = me
-                .actions
-                .recv
-                .release_capacity(padding, &mut stream, &mut me.actions.task);
-            debug_assert!(_res.is_ok());
             me.actions
                 .recv
                 .announce_window_at_once(&mut me.actions.task);
@@ -3464,7 +3459,9 @@ impl OpaqueStreamRef {
 
         me.actions
             .recv
-            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+            .release_capacity(capacity, &mut stream, &mut me.actions.task)?;
+        stream.take_data(capacity);
+        Ok(())
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.

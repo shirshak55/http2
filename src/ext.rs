@@ -260,6 +260,9 @@ struct ReceivedBody {
     /// Whether it dropped a DATA frame it had to keep (see [`BodyFrames::dropped`]).
     dropped: bool,
     trailers: Option<HeaderBlockEncoding>,
+    /// The flow-controlled octets the stream it was relayed on carried before its reset
+    /// (see [`BodyFrames::relay_reset`]).
+    relay_sent: Option<u64>,
 }
 
 /// The most DATA frames a [`BodyFrames`] holds untaken; it drops any more.
@@ -318,6 +321,18 @@ impl BodyFrames {
     /// Takes how the trailers' header block went, once it arrived.
     pub fn take_trailers(&self) -> Option<HeaderBlockEncoding> {
         self.lock().trailers.take()
+    }
+
+    /// Tells that the stream the body was relayed on was reset once `sent` octets of
+    /// flow-controlled data went on it: the data taken past those, which its peer never
+    /// grants, grows the connection's receive window once the body's stream goes, as the
+    /// data never taken does.
+    pub fn relay_reset(&self, sent: u64) {
+        self.lock().relay_sent = Some(sent);
+    }
+
+    pub(crate) fn relay_sent(&self) -> Option<u64> {
+        self.lock().relay_sent
     }
 }
 

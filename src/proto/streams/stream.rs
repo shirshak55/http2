@@ -94,10 +94,12 @@ pub(super) struct Stream {
     /// relaying peer isn't sent, which a WINDOW_UPDATE of the connection's own grows it by.
     pub unrelayed_padding: WindowSize,
 
-    /// The padding of the frames received while the window didn't grow only by relayed
-    /// WINDOW_UPDATEs that are not yet taken, which taking each releases: should the window
-    /// come to, the relaying peer, sent those frames' padding, grows the windows by it.
-    pub held_padding: WindowSize,
+    /// The data taken, its frames' padding included, and the part of it taken while the
+    /// window grew only by relayed WINDOW_UPDATEs: what of that part the relaying peer wasn't
+    /// sent before its stream was reset (see `BodyFrames::relay_reset`) the connection's
+    /// window grows by here once the stream goes.
+    pub data_taken: u64,
+    pub mirrored_taken: u64,
 
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
@@ -241,7 +243,8 @@ impl Stream {
             recv_flow,
             in_flight_recv_data: 0,
             unrelayed_padding: 0,
-            held_padding: 0,
+            data_taken: 0,
+            mirrored_taken: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
@@ -404,6 +407,14 @@ impl Stream {
         self.send_capacity_inc = true;
         tracing::trace!("  notifying task");
         self.notify_send();
+    }
+
+    /// Counts `octets` of data as taken (see `Stream::data_taken`).
+    pub fn take_data(&mut self, octets: WindowSize) {
+        self.data_taken += u64::from(octets);
+        if self.recv_flow.is_mirror() {
+            self.mirrored_taken += u64::from(octets);
+        }
     }
 
     /// Returns `Err` when the decrement cannot be completed due to overflow.

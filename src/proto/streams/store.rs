@@ -135,6 +135,11 @@ impl Store {
         self.ids.contains_key(id)
     }
 
+    /// Whether the stream `id` is here, as [`Self::find_held_mut`] finds it.
+    pub fn holds(&self, id: &StreamId) -> bool {
+        self.contains(id) || self.slab.iter().any(|(_, stream)| stream.id == *id)
+    }
+
     pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr<'_> {
         let index = SlabIndex(self.slab.insert(val) as u32);
         assert!(self.ids.insert(id, index).is_none());
